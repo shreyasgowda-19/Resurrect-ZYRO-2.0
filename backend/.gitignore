@@ -17,3 +17,5 @@ __pycache__/
 .ruff_cache/
 .coverage
 htmlcov/
+firebase-admin*.json
+*-firebase-adminsdk-*.json
