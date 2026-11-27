@@ -200,7 +200,7 @@ def selected_indices(
 @router.post("/ask", response_model=AskResponse, responses=RESPONSES)
 async def ask(request: AskRequest, actor: Actor, store: Store) -> AskResponse:
     started = perf_counter()
-    state, proposals = await run_in_threadpool(store.read_with_proposals)
+    state, proposals = await run_in_threadpool(store.read_with_proposals, expected_version=request.expected_version)
     evidence_start = perf_counter()
     firestore_seconds = evidence_start - started
     check_version(state, request.expected_version)

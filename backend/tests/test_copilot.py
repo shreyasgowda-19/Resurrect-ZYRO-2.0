@@ -38,7 +38,7 @@ class ReadOnlyStore:
         ), PLANNER, NOW)
         self.records = ProposalList(version=2, proposals=(proposal,), purchase_orders=(), audit_logs=())
 
-    def read_with_proposals(self):
+    def read_with_proposals(self, *, expected_version=None):
         return self.state, self.records
 
     def recover(self):
@@ -149,7 +149,7 @@ def test_http_errors(workflow, monkeypatch):
     assert ask(client, " " * 5).status_code == 422
     assert ask(client, "a" * 1001).status_code == 422
 
-    def unavailable():
+    def unavailable(**kwargs):
         raise StateUnavailable("Mocked database failure")
 
     monkeypatch.setattr(store, "read_with_proposals", unavailable)
@@ -244,9 +244,9 @@ def test_missing_configuration_falls_back_without_second_firestore_read(workflow
     read = store.read_with_proposals
     calls = []
 
-    def counted_read():
+    def counted_read(**kwargs):
         calls.append(1)
-        return read()
+        return read(**kwargs)
 
     monkeypatch.setattr(store, "read_with_proposals", counted_read)
     monkeypatch.setattr(gemini_service, "generate_structured", gemini_service.__dict__["_generate"])
