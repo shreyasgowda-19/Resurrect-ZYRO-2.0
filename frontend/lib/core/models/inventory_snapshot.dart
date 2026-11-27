@@ -135,6 +135,93 @@ class CustomerOrder {
   }
 }
 
+class SupplyLot {
+  const SupplyLot(
+      {required this.lotId,
+      required this.materialId,
+      required this.supplierId,
+      required this.eta,
+      required this.remainingQuantity,
+      required this.status});
+  final String lotId;
+  final String materialId;
+  final String supplierId;
+  final DateTime? eta;
+  final int remainingQuantity;
+  final String status;
+  factory SupplyLot.fromJson(Map<String, dynamic> json) => SupplyLot(
+      lotId: _requiredString(json, 'lot_id'),
+      materialId: _requiredString(json, 'material_id'),
+      supplierId: _requiredString(json, 'supplier_id'),
+      eta: _optionalDate(json, 'eta'),
+      remainingQuantity:
+          _requiredInt(json, 'remaining_quantity', nonNegative: true),
+      status: _requiredString(json, 'status'));
+}
+
+class OrderRequirement {
+  const OrderRequirement(
+      {required this.orderId,
+      required this.materialId,
+      required this.requiredQuantity});
+  final String orderId;
+  final String materialId;
+  final int requiredQuantity;
+  factory OrderRequirement.fromJson(Map<String, dynamic> json) =>
+      OrderRequirement(
+          orderId: _requiredString(json, 'order_id'),
+          materialId: _requiredString(json, 'material_id'),
+          requiredQuantity:
+              _requiredInt(json, 'required_quantity', nonNegative: true));
+}
+
+class ManufacturingEvent {
+  const ManufacturingEvent(
+      {required this.eventId,
+      required this.eventType,
+      required this.summary,
+      required this.version,
+      required this.recordedAt});
+  final String eventId;
+  final String eventType;
+  final String summary;
+  final int version;
+  final DateTime recordedAt;
+  factory ManufacturingEvent.fromJson(Map<String, dynamic> json) =>
+      ManufacturingEvent(
+          eventId: _requiredString(json, 'event_id'),
+          eventType: _requiredString(json, 'event_type'),
+          summary: _requiredString(json, 'summary'),
+          version: _requiredInt(json, 'version', nonNegative: true),
+          recordedAt: _requiredDateTime(json, 'recorded_at'));
+}
+
+class RiskAlert {
+  const RiskAlert(
+      {required this.alertId,
+      required this.orderId,
+      required this.previousRisk,
+      required this.newRisk,
+      required this.message,
+      required this.eventId,
+      required this.version});
+  final String alertId;
+  final String orderId;
+  final OrderRisk previousRisk;
+  final OrderRisk newRisk;
+  final String message;
+  final String eventId;
+  final int version;
+  factory RiskAlert.fromJson(Map<String, dynamic> json) => RiskAlert(
+      alertId: _requiredString(json, 'alert_id'),
+      orderId: _requiredString(json, 'order_id'),
+      previousRisk: OrderRisk.parse(json['previous_risk']),
+      newRisk: OrderRisk.parse(json['new_risk']),
+      message: _requiredString(json, 'message'),
+      eventId: _requiredString(json, 'event_id'),
+      version: _requiredInt(json, 'version', nonNegative: true));
+}
+
 class InventorySnapshot {
   const InventorySnapshot({
     required this.version,
@@ -142,6 +229,10 @@ class InventorySnapshot {
     required this.dataMode,
     required this.materials,
     required this.orders,
+    this.supplyLots = const [],
+    this.orderRequirements = const [],
+    this.recentEvents = const [],
+    this.alerts = const [],
   });
 
   final int version;
@@ -149,6 +240,10 @@ class InventorySnapshot {
   final String dataMode;
   final List<MaterialInventory> materials;
   final List<CustomerOrder> orders;
+  final List<SupplyLot> supplyLots;
+  final List<OrderRequirement> orderRequirements;
+  final List<ManufacturingEvent> recentEvents;
+  final List<RiskAlert> alerts;
 
   int get totalOrders => orders.length;
   int get onTrackOrders =>
@@ -186,8 +281,21 @@ class InventorySnapshot {
       orders: List<CustomerOrder>.unmodifiable(
         rawOrders.map((entry) => CustomerOrder.fromJson(_asMap(entry))),
       ),
+      supplyLots: _requiredList(json, 'supply_lots', SupplyLot.fromJson),
+      orderRequirements:
+          _requiredList(json, 'order_requirements', OrderRequirement.fromJson),
+      recentEvents:
+          _requiredList(json, 'recent_events', ManufacturingEvent.fromJson),
+      alerts: _requiredList(json, 'alerts', RiskAlert.fromJson),
     );
   }
+}
+
+List<T> _requiredList<T>(Map<String, dynamic> json, String key,
+    T Function(Map<String, dynamic>) parse) {
+  final value = json[key];
+  if (value is! List) throw FormatException('Expected $key to be a list.');
+  return List<T>.unmodifiable(value.map((entry) => parse(_asMap(entry))));
 }
 
 Map<String, dynamic> _asMap(Object? value) {
@@ -237,5 +345,15 @@ DateTime? _parseDate(Object? value, String key) {
   if (parsed == null || parsed.toIso8601String().substring(0, 10) != value) {
     throw FormatException('Invalid date for $key.');
   }
+  return parsed;
+}
+
+DateTime _requiredDateTime(Map<String, dynamic> json, String key) {
+  final value = json[key];
+  if (value is! String) {
+    throw FormatException('Expected $key to be a timestamp.');
+  }
+  final parsed = DateTime.tryParse(value);
+  if (parsed == null) throw FormatException('Invalid timestamp for $key.');
   return parsed;
 }

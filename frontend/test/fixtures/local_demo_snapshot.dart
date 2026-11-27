@@ -97,4 +97,59 @@ const localDemoSnapshotJson = <String, dynamic>{
       'shortages': [],
     },
   ],
+  'supply_lots': [
+    {
+      'lot_id': 'LOT-7001',
+      'material_id': 'MAT-001',
+      'supplier_id': 'SUP-01',
+      'eta': '2026-12-08',
+      'remaining_quantity': 400,
+      'status': 'outstanding'
+    },
+    {
+      'lot_id': 'LOT-7002',
+      'material_id': 'MAT-002',
+      'supplier_id': 'SUP-02',
+      'eta': '2026-12-11',
+      'remaining_quantity': 100,
+      'status': 'outstanding'
+    },
+  ],
+  'order_requirements': [
+    {
+      'order_id': 'ORD-1042',
+      'material_id': 'MAT-001',
+      'required_quantity': 1000
+    },
+    {
+      'order_id': 'ORD-1043',
+      'material_id': 'MAT-002',
+      'required_quantity': 300
+    },
+    {
+      'order_id': 'ORD-1044',
+      'material_id': 'MAT-002',
+      'required_quantity': 220
+    },
+  ],
+  'recent_events': [
+    {
+      'event_id': 'evt-demo-1',
+      'event_type': 'supplier_eta_update',
+      'summary': 'Supplier ETA updated for LOT-7001',
+      'version': 7,
+      'recorded_at': '2026-12-01T10:30:00Z'
+    },
+  ],
+  'alerts': [
+    {
+      'alert_id': 'alert-demo-1',
+      'order_id': 'ORD-1043',
+      'previous_risk': 'on_track',
+      'new_risk': 'at_risk',
+      'message': 'Material readiness is at risk due to a supply shortage.',
+      'event_id': 'evt-demo-1',
+      'version': 7
+    },
+  ],
 };

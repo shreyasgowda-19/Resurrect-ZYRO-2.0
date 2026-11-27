@@ -1,4 +1,6 @@
 import 'dart:async';
+import 'dart:developer' as developer;
+import 'dart:math';
 
 import 'package:flutter/material.dart';
 
@@ -30,6 +32,9 @@ class _DashboardScreenState extends State<DashboardScreen> {
   final _overviewKey = GlobalKey();
   final _materialsKey = GlobalKey();
   final _ordersKey = GlobalKey();
+  final _eventsKey = GlobalKey();
+  final _alertsKey = GlobalKey();
+  final _historyKey = GlobalKey();
   late final ApiClient _apiClient;
   late final bool _ownsApiClient;
 
@@ -43,6 +48,27 @@ class _DashboardScreenState extends State<DashboardScreen> {
   OrderRisk? _riskFilter;
   String? _selectedOrderId;
   String _selectedSection = 'overview';
+  Timer? _pollTimer;
+  bool _requestInFlight = false;
+  bool _refreshQueued = false;
+  int _requestSequence = 0;
+  bool _snapshotStale = false;
+  DateTime? _lastRefreshAt;
+  bool _submittingEvent = false;
+  String? _eventMessage;
+  bool _eventMessageError = false;
+  Map<String, dynamic>? _pendingEvent;
+  final Set<String> _seenAlertIds = {};
+  final Set<String> _newAlertIds = {};
+  String? _selectedLotId;
+  String? _selectedMaterialId;
+  String? _selectedRequirementOrderId;
+  String? _selectedRequirementMaterialId;
+  DateTime? _newEta;
+  final _receiptQuantity = TextEditingController();
+  final _adjustmentQuantity = TextEditingController();
+  final _requiredQuantity = TextEditingController();
+  DateTime? _newOrderDate;
 
   @override
   void initState() {
@@ -50,45 +76,82 @@ class _DashboardScreenState extends State<DashboardScreen> {
     _ownsApiClient = widget.apiClient == null;
     _apiClient = widget.apiClient ?? ApiClient();
     _refresh();
+    _pollTimer = Timer.periodic(const Duration(seconds: 5), (_) {
+      if (mounted && !_requestInFlight) unawaited(_loadSnapshot());
+    });
   }
 
   @override
   void dispose() {
+    _pollTimer?.cancel();
+    _receiptQuantity.dispose();
+    _adjustmentQuantity.dispose();
+    _requiredQuantity.dispose();
     if (_ownsApiClient) _apiClient.close();
     super.dispose();
   }
 
   Future<void> _refresh() async {
+    if (_requestInFlight) {
+      _refreshQueued = true;
+      return;
+    }
     setState(() {
-      _loading = true;
+      _loading = _snapshot == null;
       _error = null;
     });
     await Future.wait([_loadSnapshot(), _checkBackend()]);
   }
 
   Future<void> _loadSnapshot() async {
+    if (_requestInFlight) {
+      _refreshQueued = true;
+      return;
+    }
+    _requestInFlight = true;
+    final sequence = ++_requestSequence;
     try {
       final token = await widget.getIdToken();
       final snapshot = await _apiClient.getState(idToken: token);
-      if (!mounted) return;
+      if (!mounted || sequence != _requestSequence) return;
+      final previousVersion = _snapshot?.version ?? 0;
       setState(() {
-        _snapshot = snapshot;
-        _selectedOrderId = null;
+        if (_snapshot == null || snapshot.version >= _snapshot!.version) {
+          _snapshot = snapshot;
+          for (final alert in snapshot.alerts) {
+            if (previousVersion > 0 &&
+                alert.version > previousVersion &&
+                !_seenAlertIds.contains(alert.alertId)) {
+              _newAlertIds.add(alert.alertId);
+            }
+            _seenAlertIds.add(alert.alertId);
+          }
+        }
         _error = null;
         _loading = false;
+        _snapshotStale = false;
+        _lastRefreshAt = DateTime.now();
       });
     } on StateApiException catch (error) {
-      if (!mounted) return;
+      if (!mounted || sequence != _requestSequence) return;
       setState(() {
         _error = error;
         _loading = false;
+        _snapshotStale = _snapshot != null;
       });
     } catch (_) {
-      if (!mounted) return;
+      if (!mounted || sequence != _requestSequence) return;
       setState(() {
         _error = const StateApiException(StateApiFailure.backendError);
         _loading = false;
+        _snapshotStale = _snapshot != null;
       });
+    } finally {
+      _requestInFlight = false;
+      if (mounted && _refreshQueued) {
+        _refreshQueued = false;
+        scheduleMicrotask(() => unawaited(_loadSnapshot()));
+      }
     }
   }
 
@@ -110,6 +173,9 @@ class _DashboardScreenState extends State<DashboardScreen> {
     final key = switch (section) {
       'materials' => _materialsKey,
       'orders' => _ordersKey,
+      'events' => _eventsKey,
+      'alerts' => _alertsKey,
+      'history' => _historyKey,
       _ => _overviewKey,
     };
     await WidgetsBinding.instance.endOfFrame;
@@ -120,6 +186,150 @@ class _DashboardScreenState extends State<DashboardScreen> {
         duration: const Duration(milliseconds: 180),
         alignment: 0.02,
       ));
+    }
+  }
+
+  String _newEventId() {
+    final random = Random.secure();
+    return List<String>.generate(16, (_) {
+      return random.nextInt(256).toRadixString(16).padLeft(2, '0');
+    }).join();
+  }
+
+  Future<void> _submitEvent(String type, Map<String, dynamic> payload) async {
+    final snapshot = _snapshot;
+    developer.log(
+      'Event submit callback entered (type=$type, role=${widget.role}, snapshotAvailable=${snapshot != null}, submitting=$_submittingEvent, stale=$_snapshotStale).',
+      name: 'zyro.events',
+    );
+    if (widget.role != 'planner') {
+      developer.log('Submission stopped: signed-in role is not planner.',
+          name: 'zyro.events');
+      return;
+    }
+    if (snapshot == null || _submittingEvent || _snapshotStale) {
+      developer.log(
+        'Submission stopped by state guard (snapshotAvailable=${snapshot != null}, submitting=$_submittingEvent, stale=$_snapshotStale).',
+        name: 'zyro.events',
+      );
+      return;
+    }
+    try {
+      final request = <String, dynamic>{
+        'event_id': _newEventId(),
+        'event_type': type,
+        'expected_version': snapshot.version,
+        'payload': Map<String, dynamic>.from(payload),
+      };
+      await _sendPendingEvent(request);
+    } catch (error) {
+      if (!mounted) return;
+      developer.log(
+        'Failed to prepare an event request (${error.runtimeType}); no POST was dispatched.',
+        name: 'zyro.events',
+      );
+      setState(() {
+        _eventMessage =
+            'Could not generate a secure event ID. No event was sent; please try again.';
+        _eventMessageError = true;
+        _pendingEvent = null;
+      });
+    }
+  }
+
+  Future<void> _retryPendingEvent() async {
+    final request = _pendingEvent;
+    if (request != null && !_submittingEvent) await _sendPendingEvent(request);
+  }
+
+  Future<void> _sendPendingEvent(Map<String, dynamic> request) async {
+    setState(() {
+      _submittingEvent = true;
+      _eventMessage = null;
+    });
+    try {
+      developer.log('Requesting Firebase ID token for event submission.',
+          name: 'zyro.events');
+      final token = await widget.getIdToken();
+      developer.log('Firebase ID token obtained; invoking API client.',
+          name: 'zyro.events');
+      final result = await _apiClient.postEvent(
+        idToken: token,
+        eventId: request['event_id'] as String,
+        eventType: request['event_type'] as String,
+        expectedVersion: request['expected_version'] as int,
+        payload: Map<String, dynamic>.from(request['payload'] as Map),
+      );
+      if (!mounted) return;
+      developer.log(
+        'Event request completed (status=${result.status}, version=${result.version}).',
+        name: 'zyro.events',
+      );
+      setState(() {
+        _pendingEvent = null;
+        _eventMessage = result.isDuplicate
+            ? 'This event was already applied (snapshot v${result.version}).'
+            : 'Event applied (snapshot v${result.version}).';
+        _eventMessageError = false;
+        _receiptQuantity.clear();
+        _adjustmentQuantity.clear();
+        _requiredQuantity.clear();
+      });
+      await _loadSnapshot();
+    } on EventApiException catch (error) {
+      if (!mounted) return;
+      developer.log('Event request failed (${error.failure.name}).',
+          name: 'zyro.events');
+      final message = switch (error.failure) {
+        EventApiFailure.unauthorized =>
+          'Your session was rejected. Sign in again.',
+        EventApiFailure.forbidden =>
+          'Your verified role cannot submit manufacturing events.',
+        EventApiFailure.notFound => error.message ??
+            'The selected backend entity no longer exists. Refresh and review the form.',
+        EventApiFailure.staleVersion => error.message ??
+            'The snapshot changed. Refresh and review the updated data before submitting again.',
+        EventApiFailure.conflict =>
+          error.message ?? 'This event ID conflicts with an earlier event.',
+        EventApiFailure.validation => error.message ??
+            'The backend rejected this event data. Review the entered values.',
+        EventApiFailure.unavailable =>
+          'A required backend service is unavailable. Retry this same event when it is available.',
+        EventApiFailure.timeout =>
+          'The request timed out. Its result is uncertain; retry safely with the same event ID.',
+        EventApiFailure.connectivity =>
+          'Could not reach the backend. Its result may be uncertain; retry safely with the same event ID.',
+        EventApiFailure.malformedResponse =>
+          'The backend response was invalid. Refresh state before continuing.',
+        EventApiFailure.backendError => error.message ??
+            'The backend could not apply this event. Please retry or refresh.',
+      };
+      setState(() {
+        _eventMessage = message;
+        _eventMessageError = true;
+        _pendingEvent = {
+          EventApiFailure.timeout,
+          EventApiFailure.connectivity,
+          EventApiFailure.unavailable
+        }.contains(error.failure)
+            ? request
+            : null;
+      });
+      if (error.failure == EventApiFailure.staleVersion) await _loadSnapshot();
+    } catch (_) {
+      if (!mounted) return;
+      developer.log(
+        'Event submission failed before a recognized API response; request is retained for safe retry.',
+        name: 'zyro.events',
+      );
+      setState(() {
+        _eventMessage =
+            'Could not complete the request. Its result may be uncertain; retry safely with the same event ID.';
+        _eventMessageError = true;
+        _pendingEvent = request;
+      });
+    } finally {
+      if (mounted) setState(() => _submittingEvent = false);
     }
   }
 
@@ -206,6 +416,12 @@ class _DashboardScreenState extends State<DashboardScreen> {
             _navItem('materials', Icons.inventory_2_outlined, 'Materials'),
             _navItem(
                 'orders', Icons.local_shipping_outlined, 'Customer orders'),
+            if (widget.role == 'planner')
+              _navItem('events', Icons.precision_manufacturing_outlined,
+                  'Manufacturing Events'),
+            _navItem(
+                'alerts', Icons.notifications_active_outlined, 'Risk alerts'),
+            _navItem('history', Icons.history, 'Event history'),
             const Spacer(),
             const Divider(color: Color(0xFF303137)),
             Text(widget.email,
@@ -384,9 +600,9 @@ class _DashboardScreenState extends State<DashboardScreen> {
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.stretch,
                   children: [
-                    if (_loading)
+                    if (_loading && _snapshot == null)
                       const _LoadingPanel()
-                    else if (_error != null)
+                    else if (_error != null && _snapshot == null)
                       _ErrorPanel(
                         message: _errorMessage(_error!),
                         onRetry: _refresh,
@@ -397,6 +613,15 @@ class _DashboardScreenState extends State<DashboardScreen> {
                                 : null,
                       )
                     else if (_snapshot != null) ...[
+                      if (_snapshotStale) _staleSnapshotBanner(),
+                      if (_lastRefreshAt != null) ...[
+                        const SizedBox(height: 8),
+                        Text(
+                            'Last successful refresh: ${_formatTime(_lastRefreshAt!)}',
+                            style: const TextStyle(
+                                color: Color(0xFF9B9CA5), fontSize: 12)),
+                        const SizedBox(height: 12),
+                      ],
                       if (_snapshot!.materials.isEmpty &&
                           _snapshot!.orders.isEmpty)
                         const _EmptySnapshotPanel()
@@ -430,6 +655,27 @@ class _DashboardScreenState extends State<DashboardScreen> {
                           const SizedBox(height: 18),
                           _shortageDetails(_snapshot!),
                         ],
+                        ...[
+                          const SizedBox(height: 30),
+                          _sectionHeading(_alertsKey, 'Risk alerts',
+                              'Backend-reported customer risk changes caused by manufacturing events.'),
+                          const SizedBox(height: 14),
+                          _riskAlerts(_snapshot!),
+                        ],
+                        ...[
+                          const SizedBox(height: 30),
+                          _sectionHeading(_historyKey, 'Event history',
+                              'Recently accepted events and versions supplied by the backend.'),
+                          const SizedBox(height: 14),
+                          _eventHistory(_snapshot!),
+                        ],
+                        if (widget.role == 'planner') ...[
+                          const SizedBox(height: 30),
+                          _sectionHeading(_eventsKey, 'Manufacturing Events',
+                              'Demonstration manufacturing inputs. Changes are validated and applied by the backend.'),
+                          const SizedBox(height: 14),
+                          _eventPanel(_snapshot!, contentWidth),
+                        ],
                       ],
                     ],
                   ],
@@ -453,6 +699,461 @@ class _DashboardScreenState extends State<DashboardScreen> {
                   color: Color(0xFF9B9CA5), fontSize: 13, height: 1.4)),
         ]),
       );
+
+  Widget _staleSnapshotBanner() => Container(
+        key: const Key('stale-snapshot-banner'),
+        margin: const EdgeInsets.only(bottom: 12),
+        padding: const EdgeInsets.all(13),
+        decoration: BoxDecoration(
+            color: const Color(0xFF4A351C),
+            borderRadius: BorderRadius.circular(12),
+            border: Border.all(color: const Color(0xFFFFC266))),
+        child: Row(children: [
+          const Icon(Icons.cloud_off_outlined, color: Color(0xFFFFC266)),
+          const SizedBox(width: 10),
+          const Expanded(
+              child: Text(
+                  'Showing the last successful snapshot. Refresh failed; these values may be stale.',
+                  style: TextStyle(color: Color(0xFFFFD99A)))),
+          TextButton(onPressed: _refresh, child: const Text('Retry'))
+        ]),
+      );
+
+  Widget _riskAlerts(InventorySnapshot snapshot) => snapshot.alerts.isEmpty
+      ? const _SectionCard(
+          child:
+              _InlineEmpty(message: 'No recent risk alerts from the backend.'))
+      : Column(children: [
+          for (final alert in snapshot.alerts)
+            Card(
+              key: Key('risk-alert-${alert.alertId}'),
+              color: alert.newRisk == OrderRisk.critical ||
+                      alert.newRisk == OrderRisk.delayed
+                  ? const Color(0xFF3A252B)
+                  : null,
+              child: ListTile(
+                  onTap: () {
+                    setState(() {
+                      _selectedOrderId = alert.orderId;
+                      _newAlertIds.remove(alert.alertId);
+                    });
+                    final target = _ordersKey.currentContext;
+                    if (target != null) {
+                      unawaited(Scrollable.ensureVisible(target,
+                          duration: const Duration(milliseconds: 180)));
+                    }
+                  },
+                  leading: Icon(Icons.notifications_active_outlined,
+                      color: _riskColor(alert.newRisk)),
+                  title: Row(children: [
+                    Expanded(child: Text('Risk escalation · ${alert.orderId}')),
+                    if (_newAlertIds.contains(alert.alertId))
+                      const Chip(label: Text('NEW'))
+                  ]),
+                  subtitle: Text(
+                      '${alert.previousRisk.label} → ${alert.newRisk.label} · ${alert.message}\nEvent ${alert.eventId} · snapshot v${alert.version}'),
+                  isThreeLine: true,
+                  trailing: Icon(Icons.chevron_right,
+                      color: _riskColor(alert.newRisk))),
+            ),
+        ]);
+
+  Widget _eventHistory(InventorySnapshot snapshot) => snapshot
+          .recentEvents.isEmpty
+      ? const _SectionCard(
+          child: _InlineEmpty(
+              message: 'No recent manufacturing events from the backend.'))
+      : _SectionCard(
+          child: Column(children: [
+          for (final event in snapshot.recentEvents)
+            ListTile(
+                key: Key('event-history-${event.eventId}'),
+                contentPadding: EdgeInsets.zero,
+                leading: const Icon(Icons.history, color: Color(0xFF9B78FF)),
+                title: Text(event.eventType.replaceAll('_', ' ')),
+                subtitle: Text(
+                    '${event.summary}\n${_formatTime(event.recordedAt)} · snapshot v${event.version}'),
+                isThreeLine: true),
+        ]));
+
+  double _eventCardWidth(double width) =>
+      width >= 760 ? (width - 14) / 2 : width;
+
+  Widget _eventPanel(InventorySnapshot snapshot, double width) {
+    final lots =
+        snapshot.supplyLots.where((lot) => lot.remainingQuantity > 0).toList();
+    final requirements = snapshot.orderRequirements;
+    final lotIds = lots.map((lot) => lot.lotId).toSet();
+    final materialIds =
+        snapshot.materials.map((item) => item.materialId).toSet();
+    final orderIds = snapshot.orders.map((item) => item.orderId).toSet();
+    if (!lotIds.contains(_selectedLotId)) {
+      _selectedLotId = lots.isEmpty ? null : lots.first.lotId;
+    }
+    if (!materialIds.contains(_selectedMaterialId)) {
+      _selectedMaterialId = snapshot.materials.isEmpty
+          ? null
+          : snapshot.materials.first.materialId;
+    }
+    if (!orderIds.contains(_selectedRequirementOrderId)) {
+      _selectedRequirementOrderId =
+          snapshot.orders.isEmpty ? null : snapshot.orders.first.orderId;
+    }
+    final matchingRequirements = requirements
+        .where((item) => item.orderId == _selectedRequirementOrderId)
+        .toList();
+    if (!matchingRequirements
+        .any((item) => item.materialId == _selectedRequirementMaterialId)) {
+      _selectedRequirementMaterialId = matchingRequirements.isEmpty
+          ? null
+          : matchingRequirements.first.materialId;
+    }
+    final lot = _findOrNull(lots, (item) => item.lotId == _selectedLotId);
+    final material = _findOrNull(
+        snapshot.materials, (item) => item.materialId == _selectedMaterialId);
+    final requirement = _findOrNull(matchingRequirements,
+        (item) => item.materialId == _selectedRequirementMaterialId);
+    final order = _findOrNull(
+        snapshot.orders, (item) => item.orderId == _selectedRequirementOrderId);
+    final disabled = _submittingEvent || _snapshotStale;
+    final cards = <Widget>[
+      _eventCard(
+          width,
+          'Supplier ETA update',
+          Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+            if (lots.isEmpty)
+              const _InlineEmpty(
+                  message: 'No outstanding supply lots are available.')
+            else ...[
+              DropdownButtonFormField<String>(
+                  key: const Key('eta-lot-select'),
+                  initialValue: _selectedLotId,
+                  isExpanded: true,
+                  decoration: const InputDecoration(labelText: 'Supply lot'),
+                  items: [
+                    for (final item in lots)
+                      DropdownMenuItem(
+                          value: item.lotId, child: Text(item.lotId))
+                  ],
+                  onChanged: disabled
+                      ? null
+                      : (value) => setState(() => _selectedLotId = value)),
+              if (lot != null)
+                Padding(
+                    padding: const EdgeInsets.symmetric(vertical: 8),
+                    child: Text(
+                        'Supplier ${lot.supplierId} · Material ${lot.materialId} · Current ETA ${_displayDate(lot.eta)} · Outstanding ${lot.remainingQuantity}')),
+              OutlinedButton.icon(
+                  key: const Key('eta-date-button'),
+                  onPressed: disabled
+                      ? null
+                      : () async {
+                          final date = await _pickDate(_newEta);
+                          if (date != null && mounted) {
+                            setState(() => _newEta = date);
+                          }
+                        },
+                  icon: const Icon(Icons.calendar_month),
+                  label: Text(_newEta == null
+                      ? 'Select new arrival date'
+                      : 'New ETA ${_formatDate(_newEta!)}')),
+              if (_newEta == null)
+                const Padding(
+                  padding: EdgeInsets.only(top: 6),
+                  child: Text('Select a new arrival date to enable submission.',
+                      key: Key('eta-date-validation'),
+                      style: TextStyle(color: Color(0xFFB5B6BE), fontSize: 12)),
+                ),
+              const SizedBox(height: 8),
+              FilledButton(
+                  key: const Key('submit-eta-event'),
+                  onPressed: disabled || lot == null || _newEta == null
+                      ? null
+                      : () => _submitEvent('supplier_eta_update', {
+                            'lot_id': lot.lotId,
+                            'new_eta': _dateWire(_newEta!)
+                          }),
+                  child: const Text('Submit ETA update')),
+            ],
+          ])),
+      _eventCard(
+          width,
+          'Material receipt',
+          Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+            if (lots.isEmpty)
+              const _InlineEmpty(
+                  message: 'No outstanding supply lots are available.')
+            else ...[
+              DropdownButtonFormField<String>(
+                  key: const Key('receipt-lot-select'),
+                  initialValue: _selectedLotId,
+                  isExpanded: true,
+                  decoration: const InputDecoration(labelText: 'Supply lot'),
+                  items: [
+                    for (final item in lots)
+                      DropdownMenuItem(
+                          value: item.lotId, child: Text(item.lotId))
+                  ],
+                  onChanged: disabled
+                      ? null
+                      : (value) => setState(() => _selectedLotId = value)),
+              if (lot != null)
+                Padding(
+                    padding: const EdgeInsets.symmetric(vertical: 8),
+                    child: Text(
+                        'Outstanding quantity: ${lot.remainingQuantity} ${_findOrNull(snapshot.materials, (item) => item.materialId == lot.materialId)?.unit ?? ''}')),
+              TextField(
+                  key: const Key('receipt-quantity'),
+                  controller: _receiptQuantity,
+                  onChanged: (_) => setState(() {}),
+                  keyboardType: TextInputType.number,
+                  decoration: InputDecoration(
+                      labelText: 'Quantity received',
+                      errorText: _receiptQuantity.text.isEmpty ||
+                              (lot != null &&
+                                  _validPositive(_receiptQuantity.text,
+                                      maximum: lot.remainingQuantity))
+                          ? null
+                          : 'Enter a positive integer up to the outstanding quantity.'),
+                  enabled: !disabled),
+              const SizedBox(height: 8),
+              FilledButton(
+                  key: const Key('submit-receipt-event'),
+                  onPressed: disabled ||
+                          lot == null ||
+                          !_validPositive(_receiptQuantity.text,
+                              maximum: lot.remainingQuantity)
+                      ? null
+                      : () => _submitEvent('material_receipt', {
+                            'lot_id': lot.lotId,
+                            'quantity': int.parse(_receiptQuantity.text)
+                          }),
+                  child: const Text('Submit material receipt')),
+            ],
+          ])),
+      _eventCard(
+          width,
+          'Stock adjustment',
+          Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+            DropdownButtonFormField<String>(
+                key: const Key('adjustment-material-select'),
+                initialValue: _selectedMaterialId,
+                isExpanded: true,
+                decoration: const InputDecoration(labelText: 'Material'),
+                items: [
+                  for (final item in snapshot.materials)
+                    DropdownMenuItem(
+                        value: item.materialId,
+                        child: Text('${item.materialId} · ${item.name}'))
+                ],
+                onChanged: disabled
+                    ? null
+                    : (value) => setState(() => _selectedMaterialId = value)),
+            if (material != null)
+              Padding(
+                  padding: const EdgeInsets.symmetric(vertical: 8),
+                  child: Text(
+                      'Physical stock: ${material.onHand} ${material.unit}')),
+            TextField(
+                key: const Key('adjustment-quantity'),
+                controller: _adjustmentQuantity,
+                onChanged: (_) => setState(() {}),
+                keyboardType:
+                    const TextInputType.numberWithOptions(signed: true),
+                decoration: InputDecoration(
+                    labelText: 'Signed quantity change',
+                    errorText: _adjustmentQuantity.text.isEmpty ||
+                            (material != null &&
+                                _validAdjustment(
+                                    _adjustmentQuantity.text, material.onHand))
+                        ? null
+                        : 'Enter a nonzero integer that keeps physical stock nonnegative.'),
+                enabled: !disabled),
+            const SizedBox(height: 8),
+            FilledButton(
+                key: const Key('submit-adjustment-event'),
+                onPressed: disabled ||
+                        material == null ||
+                        !_validAdjustment(
+                            _adjustmentQuantity.text, material.onHand)
+                    ? null
+                    : () => _submitEvent('stock_adjustment', {
+                          'material_id': material.materialId,
+                          'quantity_delta': int.parse(_adjustmentQuantity.text)
+                        }),
+                child: const Text('Submit stock adjustment')),
+          ])),
+      _eventCard(
+          width,
+          'Customer order change',
+          Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+            DropdownButtonFormField<String>(
+                key: const Key('change-order-select'),
+                initialValue: _selectedRequirementOrderId,
+                isExpanded: true,
+                decoration: const InputDecoration(labelText: 'Customer order'),
+                items: [
+                  for (final item in snapshot.orders)
+                    DropdownMenuItem(
+                        value: item.orderId,
+                        child: Text('${item.orderId} · ${item.customer}'))
+                ],
+                onChanged: disabled
+                    ? null
+                    : (value) => setState(() {
+                          _selectedRequirementOrderId = value;
+                          _selectedRequirementMaterialId = null;
+                        })),
+            OutlinedButton.icon(
+                key: const Key('order-date-button'),
+                onPressed: disabled || order == null
+                    ? null
+                    : () async {
+                        final date =
+                            await _pickDate(_newOrderDate ?? order.crd);
+                        if (date != null && mounted) {
+                          setState(() => _newOrderDate = date);
+                        }
+                      },
+                icon: const Icon(Icons.calendar_month),
+                label: Text(_newOrderDate == null
+                    ? 'Select requested delivery date'
+                    : 'New CRD ${_formatDate(_newOrderDate!)}')),
+            if (_newOrderDate == null)
+              const Padding(
+                padding: EdgeInsets.only(top: 6),
+                child: Text(
+                    'Select a requested delivery date to enable submission.',
+                    key: Key('order-date-validation'),
+                    style: TextStyle(color: Color(0xFFB5B6BE), fontSize: 12)),
+              ),
+            FilledButton(
+                key: const Key('submit-order-date-event'),
+                onPressed: disabled || order == null || _newOrderDate == null
+                    ? null
+                    : () => _submitEvent('order_change', {
+                          'order_id': order.orderId,
+                          'new_crd': _dateWire(_newOrderDate!)
+                        }),
+                child: const Text('Submit date change')),
+            const Divider(height: 24),
+            if (matchingRequirements.isEmpty)
+              const _InlineEmpty(
+                  message:
+                      'No existing material requirements are available for this order.')
+            else ...[
+              DropdownButtonFormField<String>(
+                  key: const Key('requirement-material-select'),
+                  initialValue: _selectedRequirementMaterialId,
+                  isExpanded: true,
+                  decoration: const InputDecoration(
+                      labelText: 'Existing material requirement'),
+                  items: [
+                    for (final item in matchingRequirements)
+                      DropdownMenuItem(
+                          value: item.materialId, child: Text(item.materialId))
+                  ],
+                  onChanged: disabled
+                      ? null
+                      : (value) => setState(
+                          () => _selectedRequirementMaterialId = value)),
+              if (requirement != null)
+                Padding(
+                    padding: const EdgeInsets.symmetric(vertical: 8),
+                    child: Text(
+                        'Current required quantity: ${requirement.requiredQuantity}')),
+              TextField(
+                  key: const Key('required-quantity'),
+                  controller: _requiredQuantity,
+                  onChanged: (_) => setState(() {}),
+                  keyboardType: TextInputType.number,
+                  decoration: InputDecoration(
+                      labelText: 'New required quantity',
+                      errorText: _requiredQuantity.text.isEmpty ||
+                              _validPositive(_requiredQuantity.text)
+                          ? null
+                          : 'Enter a positive whole number.'),
+                  enabled: !disabled),
+              const SizedBox(height: 8),
+              FilledButton(
+                  key: const Key('submit-requirement-event'),
+                  onPressed: disabled ||
+                          order == null ||
+                          requirement == null ||
+                          !_validPositive(_requiredQuantity.text)
+                      ? null
+                      : () => _submitEvent('order_change', {
+                            'order_id': order.orderId,
+                            'material_id': requirement.materialId,
+                            'new_required_quantity':
+                                int.parse(_requiredQuantity.text)
+                          }),
+                  child: const Text('Submit requirement change')),
+            ],
+          ])),
+    ];
+    return Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+      if (_eventMessage != null)
+        Card(
+            key: const Key('event-feedback'),
+            child: Padding(
+                padding: const EdgeInsets.all(12),
+                child: Row(children: [
+                  Expanded(
+                      child: Text(_eventMessage!,
+                          style: TextStyle(
+                              color: _eventMessageError
+                                  ? const Color(0xFFFF9999)
+                                  : const Color(0xFF77E0B1)))),
+                  if (_pendingEvent != null)
+                    TextButton(
+                        key: const Key('retry-event'),
+                        onPressed: _submittingEvent ? null : _retryPendingEvent,
+                        child: const Text('Retry same event'))
+                ]))),
+      if (_snapshotStale)
+        const Text(
+            'Refresh and review the latest snapshot before submitting an event.'),
+      Wrap(spacing: 14, runSpacing: 14, children: cards),
+    ]);
+  }
+
+  Widget _eventCard(double width, String title, Widget child) => SizedBox(
+      width: _eventCardWidth(width),
+      child: _SectionCard(
+          child:
+              Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+        Text(title,
+            style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w700)),
+        const SizedBox(height: 12),
+        const Text('DEMONSTRATION MANUFACTURING INPUT',
+            style: TextStyle(
+                color: Color(0xFF9B9CA5), fontSize: 10, letterSpacing: 0.7)),
+        const SizedBox(height: 8),
+        child
+      ])));
+
+  Future<DateTime?> _pickDate(DateTime? initial) => showDatePicker(
+      context: context,
+      initialDate: initial ?? DateTime(2026, 12, 1),
+      firstDate: DateTime(2020),
+      lastDate: DateTime(2100));
+  String _dateWire(DateTime date) =>
+      '${date.year.toString().padLeft(4, '0')}-${date.month.toString().padLeft(2, '0')}-${date.day.toString().padLeft(2, '0')}';
+  bool _validPositive(String value, {int? maximum}) {
+    final parsed = int.tryParse(value);
+    return parsed != null &&
+        parsed > 0 &&
+        (maximum == null || parsed <= maximum);
+  }
+
+  bool _validAdjustment(String value, int onHand) {
+    final parsed = int.tryParse(value);
+    return parsed != null && parsed != 0 && onHand + parsed >= 0;
+  }
+
+  String _formatTime(DateTime date) =>
+      '${date.toLocal().hour.toString().padLeft(2, '0')}:${date.toLocal().minute.toString().padLeft(2, '0')}:${date.toLocal().second.toString().padLeft(2, '0')}';
 
   Widget _overviewCards(InventorySnapshot snapshot) => LayoutBuilder(
         builder: (context, constraints) {
@@ -1057,3 +1758,10 @@ String _formatDate(DateTime date) {
 String _titleCase(String value) => value.isEmpty
     ? value
     : '${value[0].toUpperCase()}${value.substring(1).replaceAll('_', ' ')}';
+
+T? _findOrNull<T>(Iterable<T> values, bool Function(T) test) {
+  for (final value in values) {
+    if (test(value)) return value;
+  }
+  return null;
+}

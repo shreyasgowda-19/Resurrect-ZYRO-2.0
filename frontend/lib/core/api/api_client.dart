@@ -1,5 +1,6 @@
 import 'dart:convert';
 import 'dart:async';
+import 'dart:developer' as developer;
 
 import 'package:http/http.dart' as http;
 
@@ -37,6 +38,35 @@ enum StateApiFailure {
   timeout,
   malformedResponse,
   backendError,
+}
+
+enum EventApiFailure {
+  unauthorized,
+  forbidden,
+  notFound,
+  staleVersion,
+  conflict,
+  validation,
+  unavailable,
+  timeout,
+  connectivity,
+  malformedResponse,
+  backendError
+}
+
+class EventApiException implements Exception {
+  const EventApiException(this.failure, {this.message});
+  final EventApiFailure failure;
+  final String? message;
+}
+
+class EventSubmission {
+  const EventSubmission(
+      {required this.eventId, required this.status, required this.version});
+  final String eventId;
+  final String status;
+  final int version;
+  bool get isDuplicate => status == 'duplicate';
 }
 
 class StateApiException implements Exception {
@@ -128,6 +158,107 @@ class ApiClient {
     } on Exception {
       throw const StateApiException(StateApiFailure.connectivity);
     }
+  }
+
+  Future<EventSubmission> postEvent(
+      {required String idToken,
+      required String eventId,
+      required String eventType,
+      required int expectedVersion,
+      required Map<String, dynamic> payload}) async {
+    final uri = Uri.parse('${ApiConfig.baseUrl}/events');
+    try {
+      developer.log(
+        'Dispatching authenticated POST /events (type=$eventType, expectedVersion=$expectedVersion).',
+        name: 'zyro.api',
+      );
+      final response = await _client
+          .post(
+            uri,
+            headers: {
+              'Authorization': 'Bearer $idToken',
+              'Content-Type': 'application/json'
+            },
+            body: jsonEncode({
+              'event_id': eventId,
+              'event_type': eventType,
+              'expected_version': expectedVersion,
+              'payload': payload
+            }),
+          )
+          .timeout(_timeout);
+      developer.log('POST /events completed with HTTP ${response.statusCode}.',
+          name: 'zyro.api');
+      if (response.statusCode == 200) {
+        try {
+          final decoded = jsonDecode(response.body);
+          if (decoded is! Map<String, dynamic> ||
+              decoded['event_id'] != eventId ||
+              decoded['event_id'] is! String ||
+              decoded['status'] is! String ||
+              decoded['version'] is! int ||
+              !const ['applied', 'duplicate'].contains(decoded['status'])) {
+            throw const FormatException();
+          }
+          return EventSubmission(
+              eventId: decoded['event_id'] as String,
+              status: decoded['status'] as String,
+              version: decoded['version'] as int);
+        } on FormatException {
+          throw const EventApiException(EventApiFailure.malformedResponse);
+        }
+      }
+      final detail = _eventErrorDetail(response.body);
+      final code = detail['code'];
+      final message =
+          detail['message'] is String ? detail['message'] as String : null;
+      if (response.statusCode == 401) {
+        throw const EventApiException(EventApiFailure.unauthorized);
+      }
+      if (response.statusCode == 403) {
+        throw const EventApiException(EventApiFailure.forbidden);
+      }
+      if (response.statusCode == 404) {
+        throw EventApiException(EventApiFailure.notFound, message: message);
+      }
+      if (response.statusCode == 409) {
+        throw EventApiException(
+            code == 'STALE_VERSION'
+                ? EventApiFailure.staleVersion
+                : EventApiFailure.conflict,
+            message: message);
+      }
+      if (response.statusCode == 422) {
+        throw EventApiException(EventApiFailure.validation, message: message);
+      }
+      if (response.statusCode == 503) {
+        throw EventApiException(EventApiFailure.unavailable, message: message);
+      }
+      throw EventApiException(EventApiFailure.backendError, message: message);
+    } on EventApiException {
+      rethrow;
+    } on TimeoutException {
+      throw const EventApiException(EventApiFailure.timeout);
+    } on Exception {
+      throw const EventApiException(EventApiFailure.connectivity);
+    }
+  }
+
+  Map<String, dynamic> _eventErrorDetail(String body) {
+    Object? decoded;
+    try {
+      decoded = jsonDecode(body);
+    } on FormatException {
+      return const {};
+    }
+    if (decoded is Map<String, dynamic> &&
+        decoded['detail'] is Map<String, dynamic>) {
+      return decoded['detail'] as Map<String, dynamic>;
+    }
+    if (decoded is Map<String, dynamic>) {
+      return decoded;
+    }
+    return const {};
   }
 
   Map<String, dynamic> _asJsonMap(Object? value) {
