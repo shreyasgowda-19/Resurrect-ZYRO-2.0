@@ -134,13 +134,15 @@ class FirestoreProposalStore(FirestoreInventoryStore):
     def list_proposals(self) -> ProposalList:
         return self.read_with_proposals()[1]
 
-    def read_with_proposals(self) -> tuple[DemoState, ProposalList]:
+    def read_with_proposals(self, *, expected_version: int | None = None) -> tuple[DemoState, ProposalList]:
         try:
             client, root = self._references()
 
             @transactional
             def read(transaction):
                 state = read_inventory(root, transaction)
+                if expected_version is not None and expected_version != state.version:
+                    raise EventError(409, "STALE_VERSION", "Refresh the dashboard before sending another question.")
                 proposals = [
                     Proposal.model_validate(document.to_dict())
                     for document in root.collection("proposals").stream(transaction=transaction, retry=None, timeout=10)
