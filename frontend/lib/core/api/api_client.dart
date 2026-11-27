@@ -6,6 +6,7 @@ import 'package:http/http.dart' as http;
 
 import '../config/api_config.dart';
 import '../models/inventory_snapshot.dart';
+import '../models/ai_copilot_models.dart';
 import '../models/proposal_models.dart';
 import '../models/recommendation_models.dart';
 
@@ -110,6 +111,25 @@ class ProposalApiException implements Exception {
   final String? message;
 }
 
+enum AiApiFailure {
+  unauthorized,
+  forbidden,
+  notFound,
+  staleVersion,
+  validation,
+  unavailable,
+  timeout,
+  connectivity,
+  malformedResponse,
+  backendError,
+}
+
+class AiApiException implements Exception {
+  const AiApiException(this.failure, {this.message});
+  final AiApiFailure failure;
+  final String? message;
+}
+
 class StateApiException implements Exception {
   const StateApiException(this.failure);
 
@@ -121,6 +141,7 @@ class ApiClient {
 
   final http.Client _client;
   static const _timeout = Duration(seconds: 5);
+  static const _aiTimeout = Duration(seconds: 30);
 
   Future<bool> checkHealth() async {
     final uri = Uri.parse('${ApiConfig.baseUrl}/health');
@@ -445,6 +466,94 @@ class ApiClient {
       _ => ProposalApiFailure.backendError,
     };
     return ProposalApiException(failure, message: message);
+  }
+
+  Future<AiAnswer> postAiQuestion({
+    required String idToken,
+    required String question,
+    required String? orderId,
+    required int expectedVersion,
+  }) async {
+    final trimmedQuestion = question.trim();
+    if (trimmedQuestion.isEmpty || trimmedQuestion.length > 1000) {
+      throw const AiApiException(AiApiFailure.validation,
+          message: 'Enter a question between 1 and 1000 characters.');
+    }
+    try {
+      final response = await _client
+          .post(
+            Uri.parse('${ApiConfig.baseUrl}/ai/ask'),
+            headers: {
+              'Authorization': 'Bearer $idToken',
+              'Content-Type': 'application/json',
+            },
+            body: jsonEncode({
+              'question': trimmedQuestion,
+              'order_id': orderId,
+              'expected_version': expectedVersion,
+            }),
+          )
+          .timeout(_aiTimeout);
+      if (response.statusCode == 200) {
+        try {
+          final answer =
+              AiAnswer.fromJson(_asJsonMap(jsonDecode(response.body)));
+          if (answer.version != expectedVersion) {
+            throw const FormatException(
+                'AI answer version does not match the request.');
+          }
+          return answer;
+        } on FormatException {
+          throw const AiApiException(AiApiFailure.malformedResponse);
+        }
+      }
+      throw _aiError(response.statusCode, response.body);
+    } on AiApiException {
+      rethrow;
+    } on TimeoutException {
+      throw const AiApiException(AiApiFailure.timeout);
+    } on Exception {
+      throw const AiApiException(AiApiFailure.connectivity);
+    }
+  }
+
+  Future<AiBriefing> getAiBriefing({required String idToken}) async {
+    try {
+      final response = await _client.get(
+        Uri.parse('${ApiConfig.baseUrl}/ai/briefing'),
+        headers: {'Authorization': 'Bearer $idToken'},
+      ).timeout(_aiTimeout);
+      if (response.statusCode == 200) {
+        try {
+          return AiBriefing.fromJson(_asJsonMap(jsonDecode(response.body)));
+        } on FormatException {
+          throw const AiApiException(AiApiFailure.malformedResponse);
+        }
+      }
+      throw _aiError(response.statusCode, response.body);
+    } on AiApiException {
+      rethrow;
+    } on TimeoutException {
+      throw const AiApiException(AiApiFailure.timeout);
+    } on Exception {
+      throw const AiApiException(AiApiFailure.connectivity);
+    }
+  }
+
+  AiApiException _aiError(int statusCode, String body) {
+    final detail = _eventErrorDetail(body);
+    final message =
+        detail['message'] is String ? detail['message'] as String : null;
+    final failure = switch (statusCode) {
+      401 => AiApiFailure.unauthorized,
+      403 => AiApiFailure.forbidden,
+      404 => AiApiFailure.notFound,
+      409 => AiApiFailure.staleVersion,
+      422 => AiApiFailure.validation,
+      503 => AiApiFailure.unavailable,
+      _ => AiApiFailure.backendError,
+    };
+    return AiApiException(failure, message: message);
   }
 
   Future<T> _postComputation<T>({

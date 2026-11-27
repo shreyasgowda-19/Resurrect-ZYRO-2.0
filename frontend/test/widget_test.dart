@@ -9,6 +9,7 @@ import 'package:zyro_inventory_frontend/app.dart';
 import 'package:zyro_inventory_frontend/core/api/api_client.dart';
 import 'package:zyro_inventory_frontend/core/auth/auth_service.dart';
 import 'package:zyro_inventory_frontend/core/models/inventory_snapshot.dart';
+import 'package:zyro_inventory_frontend/core/models/ai_copilot_models.dart';
 import 'package:zyro_inventory_frontend/core/models/proposal_models.dart';
 import 'package:zyro_inventory_frontend/core/models/recommendation_models.dart';
 
@@ -59,6 +60,8 @@ ApiClient _apiClient(
             onProposalSubmission,
         Future<http.Response> Function(http.Request request)?
             onProposalDecision,
+        Future<http.Response> Function(http.Request request)? onAiAsk,
+        Future<http.Response> Function()? onAiBriefing,
         Future<http.Response> Function()? onState,
         int Function()? stateRequestCount}) =>
     ApiClient(
@@ -105,6 +108,17 @@ ApiClient _apiClient(
           expect(request.headers['Authorization'], 'Bearer test-id-token');
           return onProposalDecision?.call(request) ??
               Future.value(http.Response('{}', 500));
+        }
+        if (request.url.path.endsWith('/ai/ask')) {
+          expect(request.headers['Authorization'], 'Bearer test-id-token');
+          return onAiAsk?.call(request) ??
+              Future.value(http.Response('{}', 500));
+        }
+        if (request.url.path.endsWith('/ai/briefing')) {
+          expect(request.headers['Authorization'], 'Bearer test-id-token');
+          return onAiBriefing?.call() ??
+              Future.value(http.Response(
+                  jsonEncode(_aiBriefingJson(includeInsights: false)), 200));
         }
         if (request.url.path.endsWith('/proposals') &&
             request.method == 'POST') {
@@ -159,6 +173,71 @@ Future<void> _openSimulatedRecommendation(WidgetTester tester,
   await tester.ensureVisible(action);
   await tester.tap(action);
   await tester.pumpAndSettle();
+}
+
+Map<String, dynamic> _aiEvidenceJson({
+  String evidenceId = 'EV-ORDER-1043',
+  String sourceType = 'order',
+  String sourceId = 'ORD-1043',
+}) =>
+    {
+      'evidence_id': evidenceId,
+      'source_type': sourceType,
+      'source_id': sourceId,
+      'summary': 'Backend reports the current order status.',
+    };
+
+Map<String, dynamic> _aiAnswerJson({
+  int version = 7,
+  String role = 'planner',
+  String mode = 'gemini',
+}) =>
+    {
+      'version': version,
+      'role': role,
+      'mode': mode,
+      'answer': 'The backend reports ORD-1043 is at risk.',
+      'evidence': [_aiEvidenceJson()],
+      'suggested_questions': ['Which material is affecting ORD-1043?'],
+      'warnings': ['This answer reflects snapshot v$version.'],
+    };
+
+Map<String, dynamic> _aiBriefingJson({
+  int version = 7,
+  String role = 'planner',
+  String mode = 'deterministic_fallback',
+  bool includeInsights = true,
+}) =>
+    {
+      'version': version,
+      'role': role,
+      'mode': mode,
+      'headline':
+          role == 'planner' ? 'Orders need attention' : 'Review decisions',
+      'summary': 'Briefing summary from verified backend records.',
+      'insights': includeInsights
+          ? [
+              {
+                'title': 'Order risk',
+                'description': 'Review the backend-reported status.',
+                'severity': 'warning',
+                'order_id': 'ORD-1043',
+                'evidence': [_aiEvidenceJson()],
+                'suggested_question': 'Explain ORD-1043.',
+              },
+            ]
+          : <Map<String, dynamic>>[],
+      'warnings': mode == 'deterministic_fallback'
+          ? ['Gemini is unavailable; verified backend facts are used.']
+          : <String>[],
+    };
+
+Future<void> _openCopilot(WidgetTester tester) async {
+  final nav = find.text('AI Copilot').first;
+  await tester.ensureVisible(nav);
+  await tester.tap(nav);
+  await tester.pumpAndSettle();
+  expect(find.byKey(const Key('ai-conversation-panel')), findsOneWidget);
 }
 
 void main() {
@@ -1428,6 +1507,310 @@ void main() {
       await tester.ensureVisible(
           find.byKey(const Key('proposal-card-PROP-7-1043-EXPEDITE')));
       expect(find.byKey(const Key('demo-purchase-orders')), findsOneWidget);
+      expect(tester.takeException(), isNull);
+    }
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+  });
+
+  test('parses strict T5 answer and briefing contracts', () {
+    final answer = AiAnswer.fromJson(_aiAnswerJson());
+    expect(answer.evidence.single.sourceId, 'ORD-1043');
+    expect(answer.mode, AiResponseMode.gemini);
+    final briefing = AiBriefing.fromJson(_aiBriefingJson(role: 'approver'));
+    expect(briefing.role, 'approver');
+    expect(briefing.insights.single.orderId, 'ORD-1043');
+    expect(() => AiAnswer.fromJson({..._aiAnswerJson(), 'mode': 'invented'}),
+        throwsFormatException);
+  });
+
+  test('both AI endpoints accept a response taking longer than five seconds',
+      () async {
+    final api = _apiClient(
+      onAiAsk: (_) async {
+        await Future<void>.delayed(const Duration(seconds: 6));
+        return http.Response(jsonEncode(_aiAnswerJson()), 200);
+      },
+      onAiBriefing: () async {
+        await Future<void>.delayed(const Duration(seconds: 6));
+        return http.Response(jsonEncode(_aiBriefingJson()), 200);
+      },
+    );
+    addTearDown(api.close);
+    final watch = Stopwatch()..start();
+    final answerFuture = api.postAiQuestion(
+      idToken: 'test-id-token',
+      question: 'Explain current order risks.',
+      orderId: null,
+      expectedVersion: 7,
+    );
+    final briefingFuture = api.getAiBriefing(idToken: 'test-id-token');
+    final answer = await answerFuture;
+    final briefing = await briefingFuture;
+    expect(watch.elapsed, greaterThan(const Duration(seconds: 5)));
+    expect(answer.answer, contains('ORD-1043'));
+    expect(briefing.mode, AiResponseMode.deterministicFallback);
+  });
+
+  test('both AI endpoints map timeout failures to the AI timeout error',
+      () async {
+    final api = _apiClient(
+      onAiAsk: (_) async => throw TimeoutException('Mocked ask timeout.'),
+      onAiBriefing: () async =>
+          throw TimeoutException('Mocked briefing timeout.'),
+    );
+    addTearDown(api.close);
+    final expectedTimeout = throwsA(isA<AiApiException>()
+        .having((error) => error.failure, 'failure', AiApiFailure.timeout));
+    await expectLater(
+      api.postAiQuestion(
+        idToken: 'test-id-token',
+        question: 'Explain current order risks.',
+        orderId: null,
+        expectedVersion: 7,
+      ),
+      expectedTimeout,
+    );
+    await expectLater(
+      api.getAiBriefing(idToken: 'test-id-token'),
+      expectedTimeout,
+    );
+  });
+
+  testWidgets('AI Copilot submits authenticated question and renders evidence',
+      (tester) async {
+    http.Request? submitted;
+    await tester.pumpWidget(ZyroInventoryApp(
+      authService: _FakeAuthService(),
+      apiClient: _apiClient(
+        onAiAsk: (request) async {
+          submitted = request;
+          return http.Response(jsonEncode(_aiAnswerJson()), 200);
+        },
+      ),
+    ));
+    await tester.pumpAndSettle();
+    await _openCopilot(tester);
+    await tester.enterText(
+        find.byKey(const Key('ai-question-input')), 'Why is ORD-1043 at risk?');
+    final submit = find.byKey(const Key('ai-ask-submit'));
+    await tester.ensureVisible(submit);
+    await tester.tap(submit);
+    await tester.pumpAndSettle();
+    expect(submitted, isNotNull);
+    expect(submitted!.url.path, endsWith('/ai/ask'));
+    final body = jsonDecode(submitted!.body) as Map<String, dynamic>;
+    expect(body['question'], 'Why is ORD-1043 at risk?');
+    expect(body['order_id'], isNull);
+    expect(body['expected_version'], 7);
+    expect(
+        find.text('The backend reports ORD-1043 is at risk.'), findsOneWidget);
+    expect(find.byKey(const ValueKey('ai-evidence-0')), findsOneWidget);
+    expect(find.text('Gemini AI'), findsOneWidget);
+    expect(find.textContaining('This answer reflects snapshot v7.'),
+        findsOneWidget);
+  });
+
+  testWidgets('deterministic fallback AI answers render normally',
+      (tester) async {
+    await tester.pumpWidget(ZyroInventoryApp(
+      authService: _FakeAuthService(),
+      apiClient: _apiClient(
+        onAiAsk: (_) async => http.Response(
+            jsonEncode(_aiAnswerJson(mode: 'deterministic_fallback')), 200),
+      ),
+    ));
+    await tester.pumpAndSettle();
+    await _openCopilot(tester);
+    await tester.enterText(
+        find.byKey(const Key('ai-question-input')), 'Why is ORD-1043 at risk?');
+    final submit = find.byKey(const Key('ai-ask-submit'));
+    await tester.ensureVisible(submit);
+    await tester.tap(submit);
+    await tester.pumpAndSettle();
+    expect(
+        find.text('The backend reports ORD-1043 is at risk.'), findsOneWidget);
+    expect(find.text('Evidence-based fallback'), findsWidgets);
+    expect(find.textContaining('Uses verified backend data'), findsWidgets);
+  });
+
+  testWidgets(
+      'briefing refreshes do not overlap or submit concurrent questions',
+      (tester) async {
+    tester.view.physicalSize = const Size(1280, 900);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+    final firstBriefing = Completer<http.Response>();
+    var briefingRequests = 0;
+    var activeBriefings = 0;
+    var maxActiveBriefings = 0;
+    var askRequests = 0;
+    Future<http.Response> loadBriefing() {
+      briefingRequests++;
+      activeBriefings++;
+      if (activeBriefings > maxActiveBriefings) {
+        maxActiveBriefings = activeBriefings;
+      }
+      final response = briefingRequests == 1
+          ? firstBriefing.future
+          : Future<http.Response>.value(
+              http.Response(jsonEncode(_aiBriefingJson()), 200));
+      return response.whenComplete(() => activeBriefings--);
+    }
+
+    await tester.pumpWidget(ZyroInventoryApp(
+      authService: _FakeAuthService(),
+      apiClient: _apiClient(
+        onAiBriefing: loadBriefing,
+        onAiAsk: (_) async {
+          askRequests++;
+          return http.Response(jsonEncode(_aiAnswerJson()), 200);
+        },
+      ),
+    ));
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 200));
+    final nav = find.text('AI Copilot').first;
+    await tester.ensureVisible(nav);
+    await tester.tap(nav);
+    await tester.pump(const Duration(milliseconds: 250));
+    final askButton = find.byKey(const Key('ai-ask-submit'));
+    await tester.ensureVisible(askButton);
+    expect(tester.widget<FilledButton>(askButton).onPressed, isNull);
+    expect(askRequests, 0);
+
+    firstBriefing.complete(http.Response(jsonEncode(_aiBriefingJson()), 200));
+    await tester.pumpAndSettle();
+    expect(maxActiveBriefings, 1);
+    expect(briefingRequests, lessThanOrEqualTo(2));
+    expect(askRequests, 0);
+    expect(tester.widget<FilledButton>(askButton).onPressed, isNotNull);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('AI fallback briefing is backend sourced and role-specific',
+      (tester) async {
+    await tester.pumpWidget(ZyroInventoryApp(
+      authService: _FakeAuthService(),
+      apiClient: _apiClient(
+        role: 'approver',
+        onAiBriefing: () async =>
+            http.Response(jsonEncode(_aiBriefingJson(role: 'approver')), 200),
+      ),
+    ));
+    await tester.pumpAndSettle();
+    await _openCopilot(tester);
+    expect(find.text('Review decisions'), findsOneWidget);
+    expect(find.text('Which proposals require approval?'), findsOneWidget);
+    expect(find.text('Evidence-based fallback'), findsWidgets);
+    expect(find.textContaining('Gemini is unavailable'), findsNWidgets(2));
+  });
+
+  testWidgets('briefing renders repeated backend titles and warnings safely',
+      (tester) async {
+    final briefing = _aiBriefingJson();
+    final insight =
+        (briefing['insights'] as List).first as Map<String, dynamic>;
+    briefing['insights'] = [
+      insight,
+      {
+        ...insight,
+        'evidence': [_aiEvidenceJson(), _aiEvidenceJson()],
+      },
+    ];
+    briefing['warnings'] = ['Repeated warning', 'Repeated warning'];
+
+    await tester.pumpWidget(ZyroInventoryApp(
+      authService: _FakeAuthService(),
+      apiClient: _apiClient(
+        onAiBriefing: () async => http.Response(jsonEncode(briefing), 200),
+      ),
+    ));
+    await tester.pumpAndSettle();
+    await _openCopilot(tester);
+    expect(find.text('Order risk'), findsNWidgets(2));
+    expect(find.text('Repeated warning'), findsNWidgets(2));
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('stale AI question refreshes and retries only after user action',
+      (tester) async {
+    var asks = 0;
+    await tester.pumpWidget(ZyroInventoryApp(
+      authService: _FakeAuthService(),
+      apiClient: _apiClient(
+        onAiAsk: (request) async {
+          asks++;
+          if (asks == 1) {
+            return http.Response(
+                jsonEncode({
+                  'detail': {
+                    'code': 'STALE_VERSION',
+                    'message': 'Refresh the dashboard before asking again.'
+                  }
+                }),
+                409);
+          }
+          return http.Response(jsonEncode(_aiAnswerJson()), 200);
+        },
+      ),
+    ));
+    await tester.pumpAndSettle();
+    await _openCopilot(tester);
+    await tester.enterText(
+        find.byKey(const Key('ai-question-input')), 'Explain risks.');
+    await tester.ensureVisible(find.byKey(const Key('ai-ask-submit')));
+    await tester.tap(find.byKey(const Key('ai-ask-submit')));
+    await tester.pumpAndSettle();
+    expect(asks, 1);
+    expect(find.byKey(const Key('ai-manual-retry')), findsOneWidget);
+    expect(find.textContaining('Refresh the dashboard'), findsOneWidget);
+    await tester.tap(find.byKey(const Key('ai-manual-retry')));
+    await tester.pumpAndSettle();
+    expect(asks, 2);
+    expect(
+        find.text('The backend reports ORD-1043 is at risk.'), findsOneWidget);
+  });
+
+  testWidgets(
+      'AI backend failures remain visible and contextual prompts bind order',
+      (tester) async {
+    http.Request? submitted;
+    await tester.pumpWidget(ZyroInventoryApp(
+      authService: _FakeAuthService(),
+      apiClient: _apiClient(
+        onAiBriefing: () async =>
+            http.Response(jsonEncode(_aiBriefingJson()), 200),
+        onAiAsk: (request) async {
+          submitted = request;
+          return http.Response(
+              '{"detail":{"message":"AI service unavailable"}}', 503);
+        },
+      ),
+    ));
+    await tester.pumpAndSettle();
+    await _openCopilot(tester);
+    await tester.ensureVisible(find.text('Order risk'));
+    await tester.tap(find.text('Ask about this insight'));
+    await tester.pumpAndSettle();
+    expect(submitted, isNotNull);
+    final body = jsonDecode(submitted!.body) as Map<String, dynamic>;
+    expect(body['order_id'], 'ORD-1043');
+    expect(find.text('AI service unavailable'), findsOneWidget);
+  });
+
+  testWidgets('AI Copilot layout remains responsive on mobile and desktop',
+      (tester) async {
+    for (final size in [const Size(390, 844), const Size(1280, 900)]) {
+      tester.view.physicalSize = size;
+      tester.view.devicePixelRatio = 1;
+      await tester.pumpWidget(ZyroInventoryApp(
+        authService: _FakeAuthService(),
+        apiClient: _apiClient(),
+      ));
+      await tester.pumpAndSettle();
+      await _openCopilot(tester);
       expect(tester.takeException(), isNull);
     }
     addTearDown(tester.view.resetPhysicalSize);
