@@ -8,7 +8,7 @@ AUTHORIZATION = {"Authorization": "Bearer mocked-token"}
 
 
 @pytest.fixture
-def client():
+def client(inventory_backend):
     with TestClient(app) as test_client:
         yield test_client
 
@@ -20,7 +20,7 @@ def test_state_matches_contract_and_is_deterministic(client, monkeypatch, role):
     assert response.status_code == 200
     payload = response.json()
     assert payload == client.get("/state", headers=AUTHORIZATION).json()
-    assert set(payload) == {"version", "as_of_date", "data_mode", "materials", "orders"}
+    assert set(payload) == {"version", "as_of_date", "data_mode", "materials", "orders", "supply_lots", "order_requirements", "recent_events", "alerts"}
     assert (payload["version"], payload["as_of_date"], payload["data_mode"]) == (1, "2026-12-01", "demo")
     assert len(payload["materials"]) == 6
     assert len(payload["orders"]) == 10

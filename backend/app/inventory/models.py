@@ -22,8 +22,9 @@ def validate_timestamp(value: datetime) -> datetime:
 
 CalendarDate = Annotated[date, BeforeValidator(validate_calendar_date)]
 Timestamp = Annotated[datetime, AfterValidator(validate_timestamp)]
-Quantity = Annotated[int, Field(strict=True, ge=0)]
-PositiveQuantity = Annotated[int, Field(strict=True, gt=0)]
+MAX_QUANTITY = 2**63 - 1
+Quantity = Annotated[int, Field(strict=True, ge=0, le=MAX_QUANTITY)]
+PositiveQuantity = Annotated[int, Field(strict=True, gt=0, le=MAX_QUANTITY)]
 Identifier = Annotated[str, Field(min_length=1)]
 Priority = Literal["high", "medium", "low"]
 Risk = Literal["delayed", "critical", "at_risk", "on_track"]
@@ -54,14 +55,21 @@ class SupplyLot(InventoryModel):
     lot_id: Identifier
     material_id: Identifier
     supplier_id: Identifier
-    quantity: PositiveQuantity
+    quantity: Quantity
     expected_arrival: CalendarDate
     status: Literal["confirmed", "unconfirmed", "received", "cancelled"]
 
 
+    @model_validator(mode="after")
+    def outstanding_quantity(self):
+        if self.status in ("confirmed", "unconfirmed") and self.quantity == 0:
+            raise ValueError("Outstanding lots require positive quantity")
+        return self
+
+
 class MaterialRequirement(InventoryModel):
     material_id: Identifier
-    quantity: PositiveQuantity
+    quantity: Quantity
 
 
 class CustomerOrder(InventoryModel):

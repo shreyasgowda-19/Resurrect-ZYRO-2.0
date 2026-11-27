@@ -31,8 +31,8 @@ def predict_risk(
     order: CustomerOrder, allocation: AllocationResult, as_of_date: date
 ) -> RiskResult:
     ready = ship = delivery = slack = None
-    if allocation.reservations:
-        ready = max(item.available_on for item in allocation.reservations)
+    if not allocation.shortages:
+        ready = max((item.available_on for item in allocation.reservations), default=as_of_date)
         ship = ready + timedelta(days=order.production_days)
         delivery = ship + timedelta(days=order.transit_days)
         slack = (order.crd - delivery).days
