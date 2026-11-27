@@ -63,11 +63,12 @@ ApiClient _apiClient(
         Future<http.Response> Function(http.Request request)? onAiAsk,
         Future<http.Response> Function()? onAiBriefing,
         Future<http.Response> Function()? onState,
-        int Function()? stateRequestCount}) =>
+        int Function()? stateRequestCount,
+        int Function()? proposalRequestCount}) =>
     ApiClient(
       client: MockClient((request) async {
         if (request.url.path.endsWith('/auth/me')) {
-          expect(request.headers['Authorization'], 'Bearer test-id-token');
+          expectSync(request.headers['Authorization'], 'Bearer test-id-token');
           return http.Response(
             jsonEncode({
               'uid': 'test-user',
@@ -79,7 +80,7 @@ ApiClient _apiClient(
         }
         if (request.url.path.endsWith('/state')) {
           stateRequestCount?.call();
-          expect(request.headers['Authorization'], 'Bearer test-id-token');
+          expectSync(request.headers['Authorization'], 'Bearer test-id-token');
           if (onState != null) return onState();
           return http.Response(
             stateStatus == 200
@@ -89,46 +90,47 @@ ApiClient _apiClient(
           );
         }
         if (request.url.path.endsWith('/events')) {
-          expect(request.headers['Authorization'], 'Bearer test-id-token');
+          expectSync(request.headers['Authorization'], 'Bearer test-id-token');
           return onEvent?.call(request) ??
               Future.value(http.Response('{}', 500));
         }
         if (request.url.path.endsWith('/recommendations')) {
-          expect(request.headers['Authorization'], 'Bearer test-id-token');
+          expectSync(request.headers['Authorization'], 'Bearer test-id-token');
           return onRecommendations?.call(request) ??
               Future.value(http.Response('{}', 500));
         }
         if (request.url.path.endsWith('/simulate')) {
-          expect(request.headers['Authorization'], 'Bearer test-id-token');
+          expectSync(request.headers['Authorization'], 'Bearer test-id-token');
           return onSimulation?.call(request) ??
               Future.value(http.Response('{}', 500));
         }
         if (request.url.path.startsWith('/proposals/') &&
             request.url.path.endsWith('/decision')) {
-          expect(request.headers['Authorization'], 'Bearer test-id-token');
+          expectSync(request.headers['Authorization'], 'Bearer test-id-token');
           return onProposalDecision?.call(request) ??
               Future.value(http.Response('{}', 500));
         }
         if (request.url.path.endsWith('/ai/ask')) {
-          expect(request.headers['Authorization'], 'Bearer test-id-token');
+          expectSync(request.headers['Authorization'], 'Bearer test-id-token');
           return onAiAsk?.call(request) ??
               Future.value(http.Response('{}', 500));
         }
         if (request.url.path.endsWith('/ai/briefing')) {
-          expect(request.headers['Authorization'], 'Bearer test-id-token');
+          expectSync(request.headers['Authorization'], 'Bearer test-id-token');
           return onAiBriefing?.call() ??
               Future.value(http.Response(
                   jsonEncode(_aiBriefingJson(includeInsights: false)), 200));
         }
         if (request.url.path.endsWith('/proposals') &&
             request.method == 'POST') {
-          expect(request.headers['Authorization'], 'Bearer test-id-token');
+          expectSync(request.headers['Authorization'], 'Bearer test-id-token');
           return onProposalSubmission?.call(request) ??
               Future.value(http.Response('{}', 500));
         }
         if (request.url.path.endsWith('/proposals') &&
             request.method == 'GET') {
-          expect(request.headers['Authorization'], 'Bearer test-id-token');
+          expectSync(request.headers['Authorization'], 'Bearer test-id-token');
+          proposalRequestCount?.call();
           return onProposals?.call() ??
               Future.value(http.Response(
                   jsonEncode({
@@ -440,14 +442,17 @@ void main() {
   testWidgets('planner submits a material receipt with backend identifiers',
       (tester) async {
     http.Request? submitted;
+    var stateRequests = 0;
     await tester.pumpWidget(ZyroInventoryApp(
         authService: _FakeAuthService(),
-        apiClient: _apiClient(onEvent: (request) async {
-          submitted = request;
-          return http.Response(
-              '{"event_id":"${jsonDecode(request.body)['event_id']}","status":"applied","version":8}',
-              200);
-        })));
+        apiClient: _apiClient(
+            stateRequestCount: () => stateRequests++,
+            onEvent: (request) async {
+              submitted = request;
+              return http.Response(
+                  '{"event_id":"${jsonDecode(request.body)['event_id']}","status":"applied","version":8}',
+                  200);
+            })));
     await tester.pumpAndSettle();
     await tester.ensureVisible(find.byKey(const Key('receipt-quantity')));
     await tester.enterText(find.byKey(const Key('receipt-quantity')), '25');
@@ -458,6 +463,8 @@ void main() {
     final body = jsonDecode(submitted!.body) as Map<String, dynamic>;
     expect(body['event_type'], 'material_receipt');
     expect(body['expected_version'], 7);
+    expect(stateRequests, 2,
+        reason: 'a successful event immediately refreshes inventory state');
     expect((body['payload'] as Map<String, dynamic>)['lot_id'], 'LOT-7001');
     expect((body['payload'] as Map<String, dynamic>)['quantity'], 25);
     expect(body['event_id'], matches(RegExp(r'^[0-9a-f]{32}$')));
@@ -692,7 +699,7 @@ void main() {
     await tester.pumpWidget(
         ZyroInventoryApp(authService: _FakeAuthService(), apiClient: client));
     await tester.pumpAndSettle();
-    await tester.pump(const Duration(seconds: 5));
+    await tester.pump(const Duration(seconds: 10));
     await tester.pumpAndSettle();
     final alert = find.byKey(const Key('risk-alert-alert-critical-8'));
     expect(alert, findsOneWidget);
@@ -717,12 +724,15 @@ void main() {
     expect(find.byKey(const Key('submit-receipt-event')), findsNothing);
   });
 
-  testWidgets('polling refreshes every five seconds and stops after disposal',
+  testWidgets(
+      'state polling uses ten seconds, skips overlap and stops after disposal',
       (tester) async {
     var stateRequests = 0;
+    var proposalRequests = 0;
     final oldResponse = Completer<http.Response>();
     final client = _apiClient(
         stateRequestCount: () => stateRequests++,
+        proposalRequestCount: () => proposalRequests++,
         onState: () {
           if (stateRequests == 1) {
             return Future.value(http.Response(
@@ -736,20 +746,146 @@ void main() {
         ZyroInventoryApp(authService: _FakeAuthService(), apiClient: client));
     await tester.pumpAndSettle();
     expect(stateRequests, 1);
-    await tester.pump(const Duration(seconds: 5));
-    await tester.pumpAndSettle();
+    expect(proposalRequests, 1);
+    await tester.pump(const Duration(seconds: 10));
+    await tester.pump();
     expect(stateRequests, 2);
-    await tester.pump(const Duration(seconds: 5));
+    expect(proposalRequests, 1);
+    tester
+        .widget<OutlinedButton>(
+            find.byKey(const Key('dashboard-refresh-button')))
+        .onPressed!
+        .call();
     expect(stateRequests, 2,
-        reason: 'polling must not overlap a pending request');
+        reason: 'manual refresh must not overlap a pending request');
     oldResponse.complete(http.Response(
         jsonEncode({...localDemoSnapshotJson, 'version': 7}), 200));
     await tester.pumpAndSettle();
+    expect(stateRequests, 3,
+        reason: 'a queued refresh runs after the pending request completes');
     expect(find.textContaining('Version 8'), findsOneWidget,
         reason: 'a lower version must not replace the current snapshot');
+    final proposalRequestsBeforeDispose = proposalRequests;
     await tester.pumpWidget(const SizedBox());
+    await tester.pump(const Duration(seconds: 30));
+    expect(stateRequests, 3);
+    expect(proposalRequests, proposalRequestsBeforeDispose,
+        reason: 'proposal polling timers must stop after disposal');
+  });
+
+  testWidgets('proposal polling is independent at fifteen seconds',
+      (tester) async {
+    var stateRequests = 0;
+    var proposalRequests = 0;
+    await tester.pumpWidget(ZyroInventoryApp(
+      authService: _FakeAuthService(),
+      apiClient: _apiClient(
+        stateRequestCount: () => stateRequests++,
+        proposalRequestCount: () => proposalRequests++,
+      ),
+    ));
+    await tester.pumpAndSettle();
+    expect(stateRequests, 1);
+    expect(proposalRequests, 1);
+
     await tester.pump(const Duration(seconds: 10));
+    await tester.pumpAndSettle();
     expect(stateRequests, 2);
+    expect(proposalRequests, 1);
+
+    await tester.pump(const Duration(seconds: 5));
+    await tester.pumpAndSettle();
+    expect(stateRequests, 2,
+        reason:
+            'proposal polling does not depend on inventory version changes');
+    expect(proposalRequests, 2);
+  });
+
+  testWidgets(
+      'polling pauses while inactive and refreshes immediately on resume',
+      (tester) async {
+    var stateRequests = 0;
+    var proposalRequests = 0;
+    await tester.pumpWidget(ZyroInventoryApp(
+      authService: _FakeAuthService(),
+      apiClient: _apiClient(
+        stateRequestCount: () => stateRequests++,
+        proposalRequestCount: () => proposalRequests++,
+      ),
+    ));
+    await tester.pumpAndSettle();
+    tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.inactive);
+    await tester.pump();
+    tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.hidden);
+    await tester.pump();
+    tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.paused);
+    await tester.pump(const Duration(seconds: 45));
+    expect(stateRequests, 1);
+    expect(proposalRequests, 1);
+
+    tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.hidden);
+    await tester.pump();
+    tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.inactive);
+    await tester.pump();
+    tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.resumed);
+    await tester.pump(const Duration(milliseconds: 200));
+    await tester.pumpAndSettle();
+    expect(stateRequests, 2);
+    expect(proposalRequests, 2);
+  });
+
+  testWidgets('network and 503 failures retain data and recover with backoff',
+      (tester) async {
+    var stateRequests = 0;
+    var proposalRequests = 0;
+    await tester.pumpWidget(ZyroInventoryApp(
+      authService: _FakeAuthService(),
+      apiClient: _apiClient(
+        stateRequestCount: () => stateRequests++,
+        proposalRequestCount: () => proposalRequests++,
+        onState: () async {
+          if (stateRequests == 2) throw http.ClientException('offline');
+          return http.Response(jsonEncode(localDemoSnapshotJson), 200);
+        },
+        onProposals: () async => http.Response(
+          jsonEncode({
+            'version': 7,
+            'proposals': [],
+            'purchase_orders': [],
+            'audit_logs': [],
+          }),
+          proposalRequests == 2 ? 503 : 200,
+        ),
+      ),
+    ));
+    await tester.pumpAndSettle();
+
+    await tester.pump(const Duration(seconds: 10));
+    await tester.pumpAndSettle();
+    expect(find.byKey(const Key('stale-snapshot-banner')), findsOneWidget);
+    expect(find.textContaining('Last successful refresh:'), findsOneWidget);
+    await tester.pump(const Duration(seconds: 2));
+    await tester.pumpAndSettle();
+    expect(stateRequests, 3,
+        reason: 'temporary network errors retry after the initial backoff');
+    expect(find.byKey(const Key('stale-snapshot-banner')), findsNothing);
+    expect(find.text('600'), findsOneWidget,
+        reason: 'last successful inventory data remains visible on failure');
+
+    await tester.pump(const Duration(seconds: 3));
+    await tester.pumpAndSettle();
+    expect(proposalRequests, 2);
+    expect(find.byKey(const Key('stale-proposals-banner')), findsOneWidget);
+    await tester.pump(const Duration(seconds: 2));
+    await tester.pumpAndSettle();
+    expect(proposalRequests, 3,
+        reason: 'HTTP 503 retries automatically after the initial backoff');
+    expect(find.byKey(const Key('stale-proposals-banner')), findsNothing);
+
+    await tester.pump(const Duration(seconds: 3));
+    await tester.pumpAndSettle();
+    expect(stateRequests, 4,
+        reason: 'normal polling resumes after connectivity recovers');
   });
 
   testWidgets('event forms remain responsive at mobile and laptop widths',
@@ -1041,7 +1177,7 @@ void main() {
     await tester.ensureVisible(action);
     await tester.tap(action);
     await tester.pumpAndSettle();
-    await tester.pump(const Duration(seconds: 5));
+    await tester.pump(const Duration(seconds: 10));
     await tester.pumpAndSettle();
 
     expect(find.byKey(const Key('recommendations-outdated')), findsOneWidget);
@@ -1133,9 +1269,11 @@ void main() {
   testWidgets('planner submits only a current successfully simulated option',
       (tester) async {
     var submissions = 0;
+    var proposalRequests = 0;
     await _openSimulatedRecommendation(
       tester,
       apiClient: _apiClient(
+        proposalRequestCount: () => proposalRequests++,
         onRecommendations: (_) async =>
             http.Response(jsonEncode(localRecommendationResponse), 200),
         onSimulation: (_) async =>
@@ -1155,6 +1293,8 @@ void main() {
     await tester.tap(submit);
     await tester.pumpAndSettle();
     expect(submissions, 1);
+    expect(proposalRequests, 2,
+        reason: 'a successful submission immediately refreshes proposals');
     expect(find.textContaining('Submitted as proposal PROP-7-1043-EXPEDITE'),
         findsOneWidget);
   });
@@ -1208,10 +1348,12 @@ void main() {
   testWidgets('approver confirms approval with reason and demo assumption ack',
       (tester) async {
     var sentRequest = <String, dynamic>{};
+    var proposalRequests = 0;
     await tester.pumpWidget(ZyroInventoryApp(
       authService: _FakeAuthService(),
       apiClient: _apiClient(
         role: 'approver',
+        proposalRequestCount: () => proposalRequests++,
         onProposals: () async =>
             http.Response(jsonEncode(localApprovalBoardJson), 200),
         onProposalDecision: (request) async {
@@ -1247,6 +1389,8 @@ void main() {
     expect(sentRequest['acknowledge_demo_assumptions'], isTrue);
     expect(sentRequest['reason'], 'Reviewed simulation and recovery evidence.');
     expect(sentRequest['decision_id'], matches(RegExp(r'^[0-9a-f]{32}$')));
+    expect(proposalRequests, 2,
+        reason: 'a successful decision immediately refreshes proposal data');
     expect(
         find.textContaining('awaiting supplier confirmation'), findsOneWidget);
   });
