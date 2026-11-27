@@ -11,7 +11,10 @@ from app.inventory.events import Event, EventError, EventResult
 from app.inventory.store import FirestoreInventoryStore, StateUnavailable, inventory_store
 
 
-class EventRoute(APIRoute):
+class StructuredRoute(APIRoute):
+    invalid_code = "INVALID_REQUEST"
+    invalid_message = "Check the request fields."
+
     def get_route_handler(self):
         handle = super().get_route_handler()
 
@@ -19,7 +22,7 @@ class EventRoute(APIRoute):
             try:
                 return await handle(request)
             except RequestValidationError:
-                error = EventError(422, "INVALID_EVENT", "Check the event type and payload fields.")
+                error = EventError(422, self.invalid_code, self.invalid_message)
             except HTTPException as exc:
                 codes = {401: "UNAUTHENTICATED", 403: "FORBIDDEN", 503: "SERVICE_UNAVAILABLE"}
                 if exc.status_code not in codes:
@@ -39,6 +42,11 @@ class EventRoute(APIRoute):
             )
 
         return event_handler
+
+
+class EventRoute(StructuredRoute):
+    invalid_code = "INVALID_EVENT"
+    invalid_message = "Check the event type and payload fields."
 
 
 router = APIRouter(route_class=EventRoute)

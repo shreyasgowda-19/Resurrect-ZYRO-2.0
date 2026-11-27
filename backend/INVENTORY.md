@@ -26,3 +26,12 @@ The initializer creates version 1 only if the authoritative document is absent. 
 The Copper demo lot is `LOT-01`. Submit a `supplier_eta_update` to move its ETA from 2026-12-05 to 2026-12-08. At version 1, this produces version 2 and escalates `ORD-1042` from `on_track` to `critical`. Alerts include the triggering change and the resulting delivery slack, shortages, or overdue CRD.
 
 For receipts, each unit increases physical on-hand and decreases the lot's outstanding quantity. The lot becomes received at zero outstanding units. Zeroing an existing material requirement retains the requirement for future changes, and an order with no positive requirements is ready on the demo date.
+
+## Recovery recommendations and simulation
+
+T3 considers at-risk, critical, and delayed orders and offers single actions only when the same allocation engine improves the target outcome. It compares risk severity first and earlier delivery within the same risk category. An overdue order can still benefit from earlier delivery while remaining delayed. A candidate can affect other orders because the allocator recalculates the entire snapshot.
+
+- Expedite a confirmed existing lot with a future ETA. The hypothetical scenario brings the ETA forward by up to three calendar days, with arrival no earlier than the day after the snapshot date. The lot ID and outstanding quantity are unchanged.
+- The only modeled alternate capability is explicitly synthetic. Existing demo supplier `SUP-02` can hypothetically supply up to 400 Copper units in four calendar days. The scenario adds a new incoming lot and leaves on-hand stock unchanged. Supplier capacity, willingness, actual lead time, currency, and incremental cost are unverified. Unknown costs and currency are returned as null.
+
+The simulation endpoint rebuilds candidates from the current snapshot before accepting an ID. If an event changes the version, refresh the state and request recommendations again. Each scenario is conditional on the stated assumptions. The endpoints leave Firestore, supplier communications, and purchase-order creation untouched.

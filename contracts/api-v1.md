@@ -159,3 +159,73 @@ Event errors contain a stable code and a message. A stale event returns HTTP 409
 ```json
 {"detail": {"code": "STALE_VERSION", "message": "Refresh the dashboard before submitting another event."}}
 ```
+
+## Recommendations and what-if simulation
+
+Planners and approvers can use both endpoints with a Firebase Bearer ID token. Each request reads a single authoritative snapshot and requires its current `expected_version`. Both endpoints are read-only.
+
+### `POST /recommendations`
+
+```json
+{"order_id":"ORD-1042","expected_version":2}
+```
+
+The response includes `order_id`, `version`, `data_mode`, and `recommendations`. An empty array means the backend found no modeled improvement using the supported actions. Example excerpt for the demo after `LOT-01` is delayed to 2026-12-08.
+
+```json
+{
+  "order_id": "ORD-1042",
+  "version": 2,
+  "data_mode": "demo",
+  "recommendations": [
+    {
+      "recommendation_id": "rec-9c5609ce75920e06e014db074dd0c789b06c4c14e51d1e56a3ccff2e61965699",
+      "action_type": "expedite_existing_lot",
+      "title": "Explore expediting LOT-01",
+      "explanation": "If the proposed ETA 2026-12-05 is achieved, the modeled delivery is 2026-12-08 (on_track). Recovery depends on the stated assumptions.",
+      "material_id": "MAT-COPPER",
+      "supplier_id": "SUP-01",
+      "lot_id": "LOT-01",
+      "quantity": 400,
+      "proposed_eta": "2026-12-05",
+      "estimated_incremental_cost": null,
+      "currency": null,
+      "assumptions": [
+        "Synthetic demo scenario assumes up to three days of acceleration. Supplier willingness and fees are unverified.",
+        "Incremental cost and currency are unknown."
+      ],
+      "evidence": [
+        "Order ORD-1042 has high priority and CRD 2026-12-10.",
+        "MAT-COPPER: 1000 required and 1000 committed to this order in the snapshot.",
+        "Baseline projected delivery: 2026-12-11 (critical).",
+        "Confirmed lot LOT-01 from Demo Allied Metals has 400 outstanding, ETA 2026-12-08."
+      ]
+    }
+  ]
+}
+```
+
+The other supported action is `alternate_supplier_po`, which has `lot_id: null`. A recommendation ID binds the version, order, and canonical action parameters. Use the ID returned for the current snapshot.
+
+### `POST /simulate`
+
+```json
+{
+  "order_id":"ORD-1042",
+  "recommendation_id":"rec-9c5609ce75920e06e014db074dd0c789b06c4c14e51d1e56a3ccff2e61965699",
+  "expected_version":2
+}
+```
+
+The response includes `order_id`, `recommendation_id`, `version`, `hypothetical: true`, `before`, `after`, `affected_orders`, `estimated_incremental_cost`, `currency`, `assumptions`, and `warnings`. Each outcome contains `projected_ship_date`, `projected_delivery_date`, `slack_days`, and `risk`. Each affected order provides `order_id`, `before`, and `after`. Only other orders with changed outcomes are included. Dates use `YYYY-MM-DD`. Missing projected dates and slack, and unknown cost and currency, are `null`.
+
+| Status | Meaning |
+| --- | --- |
+| 401 | Missing or invalid Firebase ID token |
+| 403 | Unauthorized role |
+| 404 | Unknown order or recommendation for the current snapshot |
+| 409 | Stale snapshot version |
+| 422 | Invalid request |
+| 503 | Required service unavailable |
+
+Errors use `{"detail":{"code":"STALE_VERSION","message":"Refresh the dashboard before requesting a new calculation."}}` or the corresponding error code and message.
