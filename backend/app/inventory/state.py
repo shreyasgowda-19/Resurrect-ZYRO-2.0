@@ -5,7 +5,7 @@ from fastapi import APIRouter, Depends, HTTPException
 
 from app.auth import AuthenticatedUser, authenticated_user
 from app.inventory.engine import calculate_inventory
-from app.inventory.events import EventSummary, RiskAlert
+from app.inventory.events import DemoState, EventSummary, RiskAlert
 from app.inventory.models import InventoryModel, PositiveQuantity, Priority, Quantity, Risk
 from app.inventory.store import FirestoreInventoryStore, StateUnavailable, inventory_store
 
@@ -57,16 +57,19 @@ class StateRequirement(InventoryModel):
     required_quantity: Quantity
 
 
-class StateResponse(InventoryModel):
+class StatePayload(InventoryModel):
     version: PositiveQuantity
     as_of_date: date
-    data_mode: Literal["demo"]
     materials: tuple[StateMaterial, ...]
     orders: tuple[StateOrder, ...]
     supply_lots: tuple[StateSupplyLot, ...]
     order_requirements: tuple[StateRequirement, ...]
     recent_events: tuple[EventSummary, ...]
     alerts: tuple[RiskAlert, ...]
+
+
+class StateResponse(StatePayload):
+    data_mode: Literal["demo"]
 
 
 @router.get("/state", response_model=StateResponse, responses={
@@ -82,15 +85,18 @@ def get_state(
         persisted = store.read()
     except StateUnavailable as error:
         raise HTTPException(503, str(error)) from None
+    return StateResponse(data_mode="demo", **render_state(persisted).model_dump())
+
+
+def render_state(persisted: DemoState) -> StatePayload:
     snapshot = calculate_inventory(persisted.facts)
     materials = {material.material_id: material for material in snapshot.materials}
     orders = {order.order_id: order for order in snapshot.orders}
     allocations = {allocation.order_id: allocation for allocation in snapshot.allocations}
 
-    return StateResponse(
+    return StatePayload(
         version=persisted.version,
         as_of_date=snapshot.as_of_date,
-        data_mode=snapshot.data_mode,
         supply_lots=tuple(
             StateSupplyLot(
                 lot_id=lot.lot_id,

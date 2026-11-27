@@ -136,6 +136,19 @@ class StateApiException implements Exception {
   final StateApiFailure failure;
 }
 
+class WorkspaceInfo {
+  const WorkspaceInfo({required this.name});
+
+  final String name;
+}
+
+class WorkspaceInventory {
+  const WorkspaceInventory({required this.snapshot, required this.role});
+
+  final InventorySnapshot snapshot;
+  final String role;
+}
+
 class ApiClient {
   ApiClient({http.Client? client}) : _client = client ?? http.Client();
 
@@ -185,6 +198,68 @@ class ApiClient {
       rethrow;
     } on Exception {
       throw const AuthApiException(AuthApiFailure.connectivity);
+    }
+  }
+
+  Future<WorkspaceInfo> getWorkspaceInfo(
+      {required String idToken, required String workspaceId}) async {
+    final data = await _readWorkspace(idToken, workspaceId, '');
+    final name = data['name'];
+    if (name is! String || name.trim().isEmpty) {
+      throw const StateApiException(StateApiFailure.malformedResponse);
+    }
+    return WorkspaceInfo(name: name);
+  }
+
+  Future<WorkspaceInventory> getWorkspaceState(
+      {required String idToken, required String workspaceId}) async {
+    final data = await _readWorkspace(idToken, workspaceId, '/state');
+    try {
+      return WorkspaceInventory(
+        snapshot: InventorySnapshot.fromJson(data),
+        role: data['role'] as String,
+      );
+    } on FormatException {
+      throw const StateApiException(StateApiFailure.malformedResponse);
+    }
+  }
+
+  Future<Map<String, dynamic>> _readWorkspace(
+      String idToken, String workspaceId, String suffix) async {
+    if (!RegExp(r'^[a-f0-9]{32}$').hasMatch(workspaceId)) {
+      throw const StateApiException(StateApiFailure.malformedResponse);
+    }
+    try {
+      final response = await _client
+          .get(Uri.parse('${ApiConfig.baseUrl}/workspaces/$workspaceId$suffix'),
+              headers: {'Authorization': 'Bearer $idToken'})
+          .timeout(_timeout);
+      switch (response.statusCode) {
+        case 401:
+          throw const StateApiException(StateApiFailure.unauthorized);
+        case 403:
+          throw const StateApiException(StateApiFailure.forbidden);
+        case 503:
+          throw const StateApiException(StateApiFailure.unavailable);
+        case 200:
+          final data = _asJsonMap(jsonDecode(response.body));
+          if (data['workspace_id'] != workspaceId ||
+              data['data_mode'] != 'operational' ||
+              (data['role'] != 'planner' && data['role'] != 'approver')) {
+            throw const StateApiException(StateApiFailure.malformedResponse);
+          }
+          return data;
+        default:
+          throw const StateApiException(StateApiFailure.backendError);
+      }
+    } on StateApiException {
+      rethrow;
+    } on TimeoutException {
+      throw const StateApiException(StateApiFailure.timeout);
+    } on FormatException {
+      throw const StateApiException(StateApiFailure.malformedResponse);
+    } on Exception {
+      throw const StateApiException(StateApiFailure.connectivity);
     }
   }
 

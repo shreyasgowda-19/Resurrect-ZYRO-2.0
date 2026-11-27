@@ -18,19 +18,20 @@ class AuthenticatedUser(BaseModel):
     role: Role
 
 
-def authenticated_user(
+def verified_claims(
     credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(bearer)],
-) -> AuthenticatedUser:
+) -> dict:
     if credentials is None:
         raise HTTPException(401, "Firebase ID token required", {"WWW-Authenticate": "Bearer"})
 
     try:
-        claims = firebase_service.verify_token(credentials.credentials)
+        return firebase_service.verify_token(credentials.credentials)
     except firebase_service.InvalidToken:
         raise HTTPException(401, "Invalid Firebase ID token", {"WWW-Authenticate": "Bearer"}) from None
     except firebase_service.FirebaseUnavailable:
         raise HTTPException(503, "Authentication service unavailable") from None
 
+def authenticated_user(claims: Annotated[dict, Depends(verified_claims)]) -> AuthenticatedUser:
     role = claims.get("role")
     if role not in ROLES:
         raise HTTPException(403, "Unauthorized role")

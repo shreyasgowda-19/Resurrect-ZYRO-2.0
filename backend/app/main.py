@@ -11,6 +11,7 @@ from app.inventory.event_api import router as event_router
 from app.inventory.proposal_api import router as proposal_router
 from app.inventory.recovery_api import router as recovery_router
 from app.inventory.state import router as state_router
+from app.workspace_api import router as workspace_router
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
@@ -38,6 +39,7 @@ app.include_router(event_router)
 app.include_router(recovery_router)
 app.include_router(proposal_router)
 app.include_router(copilot_router)
+app.include_router(workspace_router)
 
 
 @app.get("/health")

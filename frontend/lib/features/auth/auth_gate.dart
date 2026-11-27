@@ -3,13 +3,16 @@ import 'package:flutter/material.dart';
 import '../../core/api/api_client.dart';
 import '../../core/auth/auth_service.dart';
 import '../dashboard/dashboard_screen.dart';
+import '../workspace/operational_workspace_screen.dart';
 import 'login_screen.dart';
 
 class AuthGate extends StatelessWidget {
-  const AuthGate({super.key, required this.authService, this.apiClient});
+  const AuthGate(
+      {super.key, required this.authService, this.apiClient, this.workspaceId});
 
   final AuthService authService;
   final ApiClient? apiClient;
+  final String? workspaceId;
 
   @override
   Widget build(BuildContext context) => StreamBuilder<AuthenticatedUser?>(
@@ -31,6 +34,17 @@ class AuthGate extends StatelessWidget {
           }
           final user = snapshot.data;
           if (user == null) return LoginScreen(authService: authService);
+          final selectedWorkspace =
+              workspaceId ?? Uri.base.queryParameters['workspace'];
+          if (selectedWorkspace != null) {
+            return OperationalWorkspaceScreen(
+              key: ValueKey((user.uid, selectedWorkspace)),
+              workspaceId: selectedWorkspace,
+              getIdToken: user.getIdToken,
+              apiClient: apiClient,
+              onSignOut: () => _confirmSignOut(context, authService),
+            );
+          }
           return _ProfileLoader(
             user: user,
             authService: authService,
