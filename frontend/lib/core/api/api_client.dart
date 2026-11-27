@@ -6,6 +6,7 @@ import 'package:http/http.dart' as http;
 
 import '../config/api_config.dart';
 import '../models/inventory_snapshot.dart';
+import '../models/proposal_models.dart';
 import '../models/recommendation_models.dart';
 
 class AuthProfile {
@@ -86,6 +87,26 @@ enum ComputationApiFailure {
 class ComputationApiException implements Exception {
   const ComputationApiException(this.failure, {this.message});
   final ComputationApiFailure failure;
+  final String? message;
+}
+
+enum ProposalApiFailure {
+  unauthorized,
+  forbidden,
+  notFound,
+  staleVersion,
+  conflict,
+  validation,
+  unavailable,
+  timeout,
+  connectivity,
+  malformedResponse,
+  backendError,
+}
+
+class ProposalApiException implements Exception {
+  const ProposalApiException(this.failure, {this.message});
+  final ProposalApiFailure failure;
   final String? message;
 }
 
@@ -292,6 +313,139 @@ class ApiClient {
         },
         parse: (json) => SimulationResult.fromJson(json),
       );
+
+  Future<ApprovalBoard> getProposals({required String idToken}) async {
+    try {
+      final response = await _client.get(
+        Uri.parse('${ApiConfig.baseUrl}/proposals'),
+        headers: {'Authorization': 'Bearer $idToken'},
+      ).timeout(_timeout);
+      if (response.statusCode >= 200 && response.statusCode < 300) {
+        try {
+          return ApprovalBoard.fromJson(_asJsonMap(jsonDecode(response.body)));
+        } on FormatException {
+          throw const ProposalApiException(
+              ProposalApiFailure.malformedResponse);
+        }
+      }
+      throw _proposalError(response.statusCode, response.body);
+    } on ProposalApiException {
+      rethrow;
+    } on TimeoutException {
+      throw const ProposalApiException(ProposalApiFailure.timeout);
+    } on Exception {
+      throw const ProposalApiException(ProposalApiFailure.connectivity);
+    }
+  }
+
+  Future<ProposalSubmissionResult> postProposal({
+    required String idToken,
+    required String orderId,
+    required String recommendationId,
+    required int expectedVersion,
+  }) async {
+    try {
+      final response = await _client
+          .post(
+            Uri.parse('${ApiConfig.baseUrl}/proposals'),
+            headers: {
+              'Authorization': 'Bearer $idToken',
+              'Content-Type': 'application/json',
+            },
+            body: jsonEncode({
+              'order_id': orderId,
+              'recommendation_id': recommendationId,
+              'expected_version': expectedVersion,
+            }),
+          )
+          .timeout(_timeout);
+      if (response.statusCode >= 200 && response.statusCode < 300) {
+        try {
+          final result = ProposalSubmissionResult.fromJson(
+              _asJsonMap(jsonDecode(response.body)));
+          if (result.proposal.orderId != orderId ||
+              result.proposal.recommendationId != recommendationId ||
+              result.version != expectedVersion) {
+            throw const FormatException(
+                'Proposal response does not match the submitted request.');
+          }
+          return result;
+        } on FormatException {
+          throw const ProposalApiException(
+              ProposalApiFailure.malformedResponse);
+        }
+      }
+      throw _proposalError(response.statusCode, response.body);
+    } on ProposalApiException {
+      rethrow;
+    } on TimeoutException {
+      throw const ProposalApiException(ProposalApiFailure.timeout);
+    } on Exception {
+      throw const ProposalApiException(ProposalApiFailure.connectivity);
+    }
+  }
+
+  Future<ProposalDecisionResult> postProposalDecision({
+    required String idToken,
+    required String proposalId,
+    required ProposalDecisionRequest request,
+  }) async {
+    try {
+      final response = await _client
+          .post(
+            Uri.parse(
+                '${ApiConfig.baseUrl}/proposals/${Uri.encodeComponent(proposalId)}/decision'),
+            headers: {
+              'Authorization': 'Bearer $idToken',
+              'Content-Type': 'application/json',
+            },
+            body: jsonEncode(request.toJson()),
+          )
+          .timeout(_timeout);
+      if (response.statusCode >= 200 && response.statusCode < 300) {
+        try {
+          final result = ProposalDecisionResult.fromJson(
+              _asJsonMap(jsonDecode(response.body)));
+          if (result.proposal.proposalId != proposalId ||
+              (result.purchaseOrder != null &&
+                  result.purchaseOrder!.proposalId != proposalId)) {
+            throw const FormatException(
+                'Decision response does not match the submitted proposal.');
+          }
+          return result;
+        } on FormatException {
+          throw const ProposalApiException(
+              ProposalApiFailure.malformedResponse);
+        }
+      }
+      throw _proposalError(response.statusCode, response.body);
+    } on ProposalApiException {
+      rethrow;
+    } on TimeoutException {
+      throw const ProposalApiException(ProposalApiFailure.timeout);
+    } on Exception {
+      throw const ProposalApiException(ProposalApiFailure.connectivity);
+    }
+  }
+
+  ProposalApiException _proposalError(int statusCode, String body) {
+    final detail = _eventErrorDetail(body);
+    final code = detail['code'];
+    final message =
+        detail['message'] is String ? detail['message'] as String : null;
+    final failure = switch (statusCode) {
+      401 => ProposalApiFailure.unauthorized,
+      403 => ProposalApiFailure.forbidden,
+      404 => ProposalApiFailure.notFound,
+      409 => code == 'STALE_VERSION'
+          ? ProposalApiFailure.staleVersion
+          : ProposalApiFailure.conflict,
+      422 => ProposalApiFailure.validation,
+      503 => ProposalApiFailure.unavailable,
+      _ => ProposalApiFailure.backendError,
+    };
+    return ProposalApiException(failure, message: message);
+  }
 
   Future<T> _postComputation<T>({
     required String path,

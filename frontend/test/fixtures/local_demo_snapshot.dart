@@ -234,3 +234,89 @@ const localSimulationResponse = <String, dynamic>{
   'assumptions': ['Receipt timing remains hypothetical.'],
   'warnings': ['Other orders may be affected by shared material allocation.'],
 };
+
+const localApprovalProposal = <String, dynamic>{
+  'proposal_id': 'PROP-7-1043-EXPEDITE',
+  'order_id': 'ORD-1043',
+  'recommendation_id': 'REC-EXPEDITE-7-1043',
+  'action_type': 'expedite_existing_lot',
+  'snapshot_version': 7,
+  'status': 'pending',
+  'is_stale': false,
+  'created_by': 'planner-user',
+  'created_at': '2026-12-01T11:00:00Z',
+  'recommendation': {
+    'recommendation_id': 'REC-EXPEDITE-7-1043',
+    'action_type': 'expedite_existing_lot',
+    'title': 'Expedite existing steel lot',
+    'explanation': 'Move the existing supplier lot forward for evaluation.',
+    'material_id': 'MAT-002',
+    'supplier_id': 'SUP-02',
+    'lot_id': 'LOT-7002',
+    'quantity': 100,
+    'proposed_eta': '2026-12-09',
+    'estimated_incremental_cost': null,
+    'currency': null,
+    'assumptions': ['Supplier can meet the proposed ETA.'],
+    'evidence': ['Current ETA is 11 Dec 2026.'],
+  },
+  'simulation': localSimulationResponse,
+  'decided_by': null,
+  'decided_at': null,
+  'decision_reason': null,
+  'purchase_order_id': null,
+  'execution_status': 'not_executed',
+};
+
+const localDemoPurchaseOrder = <String, dynamic>{
+  'purchase_order_id': 'DPO-001',
+  'proposal_id': 'PROP-7-1043-ALT',
+  'order_id': 'ORD-1043',
+  'supplier_id': 'SUP-03',
+  'material_id': 'MAT-002',
+  'quantity': 100,
+  'expected_delivery_date': '2026-12-08',
+  'estimated_incremental_cost': 42.5,
+  'currency': 'USD',
+  'status': 'demo_created',
+  'created_by': 'approver-user',
+  'created_at': '2026-12-01T12:00:00Z',
+};
+
+const localApprovalAudit = <String, dynamic>{
+  'audit_id': 'AUDIT-001',
+  'action': 'proposal_submitted',
+  'actor_uid': 'planner-user',
+  'actor_role': 'planner',
+  'proposal_id': 'PROP-7-1043-EXPEDITE',
+  'timestamp': '2026-12-01T11:00:00Z',
+  'version': 7,
+  'summary': 'Planner submitted a supplier lot expedite proposal.',
+};
+
+const localApprovalBoardJson = <String, dynamic>{
+  'version': 7,
+  'proposals': [localApprovalProposal],
+  'purchase_orders': [localDemoPurchaseOrder],
+  'audit_logs': [localApprovalAudit],
+};
+
+const localProposalSubmissionJson = <String, dynamic>{
+  'status': 'created',
+  'version': 7,
+  'proposal': localApprovalProposal,
+};
+
+final localProposalDecisionJson = <String, dynamic>{
+  'status': 'applied',
+  'version': 8,
+  'proposal': {
+    ...localApprovalProposal,
+    'status': 'approved',
+    'decided_by': 'approver-user',
+    'decided_at': '2026-12-01T12:00:00Z',
+    'decision_reason': 'Reviewed simulation and recovery evidence.',
+    'execution_status': 'awaiting_supplier_confirmation',
+  },
+  'purchase_order': null,
+};

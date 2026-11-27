@@ -6,11 +6,13 @@ import 'package:flutter/material.dart';
 
 import '../../core/api/api_client.dart';
 import '../../core/models/inventory_snapshot.dart';
+import '../../core/models/proposal_models.dart';
 import '../../core/models/recommendation_models.dart';
 
 class DashboardScreen extends StatefulWidget {
   const DashboardScreen({
     super.key,
+    required this.uid,
     required this.email,
     required this.role,
     required this.getIdToken,
@@ -19,6 +21,7 @@ class DashboardScreen extends StatefulWidget {
   });
 
   final String email;
+  final String uid;
   final String role;
   final Future<String> Function() getIdToken;
   final ApiClient? apiClient;
@@ -36,6 +39,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
   final _eventsKey = GlobalKey();
   final _alertsKey = GlobalKey();
   final _historyKey = GlobalKey();
+  final _approvalsKey = GlobalKey();
   late final ApiClient _apiClient;
   late final bool _ownsApiClient;
 
@@ -78,6 +82,19 @@ class _DashboardScreenState extends State<DashboardScreen> {
   final Map<String, String> _simulationErrors = {};
   final Set<String> _simulationLoads = {};
   final Map<String, int> _simulationSequences = {};
+  ApprovalBoard? _approvalBoard;
+  String? _approvalError;
+  bool _approvalLoading = false;
+  bool _proposalsRequestInFlight = false;
+  int _proposalsRequestSequence = 0;
+  bool _proposalsRefreshQueued = false;
+  final Set<String> _proposalSubmitting = {};
+  final Map<String, String> _proposalErrors = {};
+  final Map<String, String> _proposalMessages = {};
+  final Set<String> _decisionSubmitting = {};
+  final Map<String, ProposalDecisionRequest> _pendingDecisions = {};
+  final Map<String, String> _decisionErrors = {};
+  final Map<String, String> _decisionMessages = {};
 
   @override
   void initState() {
@@ -86,7 +103,10 @@ class _DashboardScreenState extends State<DashboardScreen> {
     _apiClient = widget.apiClient ?? ApiClient();
     _refresh();
     _pollTimer = Timer.periodic(const Duration(seconds: 5), (_) {
-      if (mounted && !_requestInFlight) unawaited(_loadSnapshot());
+      if (mounted) {
+        if (!_requestInFlight) unawaited(_loadSnapshot());
+        if (!_proposalsRequestInFlight) unawaited(_loadProposals());
+      }
     });
   }
 
@@ -109,7 +129,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
       _loading = _snapshot == null;
       _error = null;
     });
-    await Future.wait([_loadSnapshot(), _checkBackend()]);
+    await Future.wait([_loadSnapshot(), _checkBackend(), _loadProposals()]);
   }
 
   Future<void> _loadSnapshot() async {
@@ -174,6 +194,50 @@ class _DashboardScreenState extends State<DashboardScreen> {
     });
   }
 
+  Future<void> _loadProposals() async {
+    if (_proposalsRequestInFlight) {
+      _proposalsRefreshQueued = true;
+      return;
+    }
+    _proposalsRequestInFlight = true;
+    final sequence = ++_proposalsRequestSequence;
+    if (mounted && _approvalBoard == null) {
+      setState(() {
+        _approvalLoading = true;
+        _approvalError = null;
+      });
+    }
+    try {
+      final token = await widget.getIdToken();
+      final board = await _apiClient.getProposals(idToken: token);
+      if (!mounted || sequence != _proposalsRequestSequence) return;
+      setState(() {
+        _approvalBoard = board;
+        _approvalError = null;
+        _approvalLoading = false;
+      });
+    } on ProposalApiException catch (error) {
+      if (!mounted || sequence != _proposalsRequestSequence) return;
+      setState(() {
+        _approvalError = _proposalErrorMessage(error);
+        _approvalLoading = false;
+      });
+    } catch (_) {
+      if (!mounted || sequence != _proposalsRequestSequence) return;
+      setState(() {
+        _approvalError =
+            'Approval records could not be loaded. Retry the request.';
+        _approvalLoading = false;
+      });
+    } finally {
+      _proposalsRequestInFlight = false;
+      if (mounted && _proposalsRefreshQueued) {
+        _proposalsRefreshQueued = false;
+        scheduleMicrotask(() => unawaited(_loadProposals()));
+      }
+    }
+  }
+
   Future<void> _selectSection(String section) async {
     setState(() => _selectedSection = section);
     if (_scaffoldKey.currentState?.isDrawerOpen == true) {
@@ -185,6 +249,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
       'events' => _eventsKey,
       'alerts' => _alertsKey,
       'history' => _historyKey,
+      'approvals' => _approvalsKey,
       _ => _overviewKey,
     };
     await WidgetsBinding.instance.endOfFrame;
@@ -479,6 +544,227 @@ class _DashboardScreenState extends State<DashboardScreen> {
           error.message ?? 'The backend could not complete the computation.',
       };
 
+  String _proposalErrorMessage(ProposalApiException error) =>
+      switch (error.failure) {
+        ProposalApiFailure.unauthorized =>
+          'Your sign-in session was rejected. Sign in again.',
+        ProposalApiFailure.forbidden =>
+          'Your verified role is not authorized for this proposal action.',
+        ProposalApiFailure.notFound =>
+          error.message ?? 'The proposal was not found.',
+        ProposalApiFailure.staleVersion =>
+          'The inventory version changed. Current state and approval records are refreshing.',
+        ProposalApiFailure.conflict => error.message ??
+            'This action conflicts with a newer proposal decision.',
+        ProposalApiFailure.validation =>
+          error.message ?? 'The request did not pass backend validation.',
+        ProposalApiFailure.unavailable =>
+          'A required backend service is unavailable. Retry when available.',
+        ProposalApiFailure.timeout =>
+          'The request timed out. If it may have been applied, retry safely using the same request.',
+        ProposalApiFailure.connectivity =>
+          'Could not connect to the proposal service. Retry using the same request if submission was uncertain.',
+        ProposalApiFailure.malformedResponse =>
+          'The backend returned data that does not match the approved T4 contract.',
+        ProposalApiFailure.backendError =>
+          error.message ?? 'The backend could not complete this action.',
+      };
+
+  Future<void> _submitProposal(
+    CustomerOrder order,
+    InventoryRecommendation recommendation,
+    SimulationResult simulation,
+  ) async {
+    final snapshot = _snapshot;
+    final recommendationKey = recommendation.recommendationId;
+    if (widget.role != 'planner' ||
+        snapshot == null ||
+        _snapshotStale ||
+        simulation.version != snapshot.version ||
+        _proposalSubmitting.contains(recommendationKey)) {
+      return;
+    }
+    if (simulation.orderId != order.orderId ||
+        simulation.recommendationId != recommendation.recommendationId) {
+      setState(() => _proposalErrors[recommendationKey] =
+          'The simulation does not match this order and recommendation. Run it again.');
+      return;
+    }
+    final version = snapshot.version;
+    setState(() {
+      _proposalSubmitting.add(recommendationKey);
+      _proposalErrors.remove(recommendationKey);
+      _proposalMessages.remove(recommendationKey);
+    });
+    try {
+      final token = await widget.getIdToken();
+      final result = await _apiClient.postProposal(
+        idToken: token,
+        orderId: order.orderId,
+        recommendationId: recommendation.recommendationId,
+        expectedVersion: version,
+      );
+      if (!mounted) return;
+      setState(() {
+        _proposalMessages[recommendationKey] = result.status == 'duplicate'
+            ? 'This recommendation already has proposal ${result.proposal.proposalId} for v${result.version}.'
+            : 'Submitted as proposal ${result.proposal.proposalId} for approver review.';
+      });
+      await _loadProposals();
+      if (_snapshot?.version != version) await _loadSnapshot();
+    } on ProposalApiException catch (error) {
+      if (!mounted) return;
+      setState(() =>
+          _proposalErrors[recommendationKey] = _proposalErrorMessage(error));
+      if (error.failure == ProposalApiFailure.staleVersion) {
+        await Future.wait([_loadSnapshot(), _loadProposals()]);
+      }
+    } catch (_) {
+      if (mounted) {
+        setState(() => _proposalErrors[recommendationKey] =
+            'Proposal submission failed. Check the connection and retry.');
+      }
+    } finally {
+      if (mounted) {
+        setState(() => _proposalSubmitting.remove(recommendationKey));
+      }
+    }
+  }
+
+  Future<void> _beginProposalDecision(
+      ApprovalProposal proposal, String decision) async {
+    final existingRequest = _pendingDecisions[proposal.proposalId];
+    if (existingRequest != null) {
+      await _submitProposalDecision(proposal, existingRequest, retry: true);
+      return;
+    }
+    final snapshot = _snapshot;
+    if (widget.role != 'approver' ||
+        proposal.status != ProposalStatus.pending ||
+        snapshot == null ||
+        _snapshotStale ||
+        _decisionSubmitting.contains(proposal.proposalId)) {
+      return;
+    }
+    final isStale =
+        proposal.isStale || proposal.snapshotVersion != snapshot.version;
+    if (decision == 'approve' && isStale) {
+      setState(() => _decisionErrors[proposal.proposalId] =
+          'This proposal is stale and cannot be approved. Review the current snapshot and ask the planner to submit a fresh proposal.');
+      return;
+    }
+    if (decision == 'approve' && proposal.createdBy == widget.uid) {
+      setState(() => _decisionErrors[proposal.proposalId] =
+          'You cannot approve a proposal you created.');
+      return;
+    }
+
+    final form = await showDialog<(String, bool)?>(
+      context: context,
+      barrierDismissible: false,
+      builder: (_) => _ProposalDecisionDialog(
+        proposal: proposal,
+        currentVersion: snapshot.version,
+        decision: decision,
+      ),
+    );
+    if (form == null || !mounted) return;
+    try {
+      final request = ProposalDecisionRequest(
+        decisionId: _newEventId(),
+        decision: decision,
+        expectedVersion: snapshot.version,
+        reason: form.$1,
+        acknowledgeDemoAssumptions: form.$2,
+      );
+      _pendingDecisions[proposal.proposalId] = request;
+      await _submitProposalDecision(proposal, request);
+    } catch (_) {
+      if (mounted) {
+        setState(() => _decisionErrors[proposal.proposalId] =
+            'A secure decision ID could not be generated. No decision request was sent.');
+      }
+    }
+  }
+
+  Future<void> _retryProposalDecision(ApprovalProposal proposal) async {
+    final request = _pendingDecisions[proposal.proposalId];
+    if (request != null) {
+      await _submitProposalDecision(proposal, request, retry: true);
+    }
+  }
+
+  Future<void> _submitProposalDecision(
+      ApprovalProposal proposal, ProposalDecisionRequest request,
+      {bool retry = false}) async {
+    final proposalId = proposal.proposalId;
+    if (widget.role != 'approver' ||
+        _decisionSubmitting.contains(proposalId) ||
+        request.reason.trim().isEmpty) {
+      return;
+    }
+    if (request.decision == 'approve' && proposal.createdBy == widget.uid) {
+      setState(() => _decisionErrors[proposalId] =
+          'You cannot approve a proposal you created.');
+      return;
+    }
+    setState(() {
+      _decisionSubmitting.add(proposalId);
+      _decisionErrors.remove(proposalId);
+      _decisionMessages.remove(proposalId);
+    });
+    try {
+      final token = await widget.getIdToken();
+      if (!retry &&
+          (_snapshot == null ||
+              _snapshotStale ||
+              _snapshot!.version != request.expectedVersion)) {
+        _pendingDecisions.remove(proposalId);
+        if (mounted) {
+          setState(() => _decisionErrors[proposalId] =
+              'The inventory changed before the decision was sent. Review the refreshed proposal and confirm again.');
+        }
+        await Future.wait([_loadSnapshot(), _loadProposals()]);
+        return;
+      }
+      final result = await _apiClient.postProposalDecision(
+        idToken: token,
+        proposalId: proposalId,
+        request: request,
+      );
+      if (!mounted) return;
+      _pendingDecisions.remove(proposalId);
+      final execution = result.proposal.executionStatus;
+      setState(() {
+        _decisionMessages[proposalId] = request.decision == 'reject'
+            ? 'Proposal rejected at version ${result.version}.'
+            : execution == ProposalExecutionStatus.demoPoCreated
+                ? 'Approved at version ${result.version}. A demonstration purchase order was created; no real supplier transaction occurred.'
+                : execution ==
+                        ProposalExecutionStatus.awaitingSupplierConfirmation
+                    ? 'Expedite authorized at version ${result.version}; awaiting supplier confirmation.'
+                    : 'Approval applied at version ${result.version}.';
+      });
+      await Future.wait([_loadProposals(), _loadSnapshot()]);
+    } on ProposalApiException catch (error) {
+      if (!mounted) return;
+      setState(
+          () => _decisionErrors[proposalId] = _proposalErrorMessage(error));
+      if (error.failure == ProposalApiFailure.staleVersion ||
+          error.failure == ProposalApiFailure.conflict) {
+        _pendingDecisions.remove(proposalId);
+        await Future.wait([_loadSnapshot(), _loadProposals()]);
+      }
+    } catch (_) {
+      if (mounted) {
+        setState(() => _decisionErrors[proposalId] =
+            'Decision submission failed. Retry will reuse the same decision ID and request payload.');
+      }
+    } finally {
+      if (mounted) setState(() => _decisionSubmitting.remove(proposalId));
+    }
+  }
+
   String _errorMessage(StateApiException error) => switch (error.failure) {
         StateApiFailure.unauthorized =>
           'Your sign-in session was rejected. Sign out and authenticate again.',
@@ -568,6 +854,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
             _navItem(
                 'alerts', Icons.notifications_active_outlined, 'Risk alerts'),
             _navItem('history', Icons.history, 'Event history'),
+            _navItem('approvals', Icons.fact_check_outlined, 'Approvals'),
             const Spacer(),
             const Divider(color: Color(0xFF303137)),
             Text(widget.email,
@@ -823,6 +1110,14 @@ class _DashboardScreenState extends State<DashboardScreen> {
                           _eventPanel(_snapshot!, contentWidth),
                         ],
                       ],
+                      const SizedBox(height: 30),
+                      _sectionHeading(
+                        _approvalsKey,
+                        'Approvals',
+                        'Human-reviewed proposals, demonstration purchase orders and persistent decision audit history.',
+                      ),
+                      const SizedBox(height: 14),
+                      _approvalWorkspace(contentWidth),
                     ],
                   ],
                 ),
@@ -1262,6 +1557,340 @@ class _DashboardScreenState extends State<DashboardScreen> {
             'Refresh and review the latest snapshot before submitting an event.'),
       Wrap(spacing: 14, runSpacing: 14, children: cards),
     ]);
+  }
+
+  Widget _approvalWorkspace(double width) {
+    final board = _approvalBoard;
+    if (_approvalError != null && board == null) {
+      return _SectionCard(
+        child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          _InlineErrorMessage(_approvalError!),
+          const SizedBox(height: 10),
+          OutlinedButton.icon(
+            key: const Key('retry-proposals'),
+            onPressed: _approvalLoading ? null : _loadProposals,
+            icon: const Icon(Icons.refresh),
+            label: const Text('Retry approvals'),
+          ),
+        ]),
+      );
+    }
+    if (board == null) {
+      return _SectionCard(
+        child: _approvalLoading
+            ? const Row(children: [
+                SizedBox(
+                    width: 18,
+                    height: 18,
+                    child: CircularProgressIndicator(strokeWidth: 2)),
+                SizedBox(width: 12),
+                Text('Loading approval records…'),
+              ])
+            : Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                const _InlineEmpty(
+                    message: 'Approval records are unavailable.'),
+                TextButton.icon(
+                    onPressed: _loadProposals,
+                    icon: const Icon(Icons.refresh),
+                    label: const Text('Retry')),
+              ]),
+      );
+    }
+    final currentVersion = _snapshot?.version ?? board.version;
+    return Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+      _SectionCard(
+        child: Wrap(spacing: 10, runSpacing: 8, children: [
+          _MetadataChip(
+              icon: Icons.tag,
+              label: 'Current inventory v$currentVersion',
+              color: const Color(0xFFB5B6BE)),
+          _MetadataChip(
+              icon: Icons.fact_check_outlined,
+              label: '${board.proposals.length} proposal records',
+              color: const Color(0xFF9B78FF)),
+          _MetadataChip(
+              icon: Icons.update,
+              label: 'Proposal list v${board.version}',
+              color: const Color(0xFFB5B6BE)),
+          OutlinedButton.icon(
+            key: const Key('refresh-proposals'),
+            onPressed: _approvalLoading ? null : _loadProposals,
+            icon: _approvalLoading
+                ? const SizedBox(
+                    width: 14,
+                    height: 14,
+                    child: CircularProgressIndicator(strokeWidth: 2))
+                : const Icon(Icons.refresh, size: 17),
+            label: const Text('Refresh approvals'),
+          ),
+        ]),
+      ),
+      if (_approvalError != null) ...[
+        const SizedBox(height: 8),
+        _InlineErrorMessage(
+            'Showing the last successful approval records. $_approvalError'),
+      ],
+      const SizedBox(height: 12),
+      if (board.proposals.isEmpty)
+        const _SectionCard(
+            child:
+                _InlineEmpty(message: 'No approval proposals are available.'))
+      else
+        LayoutBuilder(builder: (context, constraints) {
+          final cardWidth = constraints.maxWidth >= 1050
+              ? (constraints.maxWidth - 14) / 2
+              : constraints.maxWidth;
+          return Wrap(
+            key: const Key('approval-proposals-list'),
+            spacing: 14,
+            runSpacing: 14,
+            children: [
+              for (final proposal in board.proposals)
+                SizedBox(
+                    width: cardWidth,
+                    child: _approvalProposalCard(proposal, currentVersion)),
+            ],
+          );
+        }),
+      const SizedBox(height: 22),
+      _SectionCard(
+        key: const Key('demo-purchase-orders'),
+        child:
+            Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+          const Text('Demonstration purchase orders',
+              style: TextStyle(fontSize: 17, fontWeight: FontWeight.w700)),
+          const SizedBox(height: 4),
+          const Text(
+              'Backend-created demo records only. These are not real supplier transactions.',
+              style: TextStyle(color: Color(0xFFB5B6BE), fontSize: 12)),
+          if (board.purchaseOrders.isEmpty)
+            const _InlineEmpty(
+                message: 'No demonstration purchase orders have been created.')
+          else
+            for (final po in board.purchaseOrders) _purchaseOrderTile(po),
+        ]),
+      ),
+      const SizedBox(height: 22),
+      _SectionCard(
+        key: const Key('approval-audit-timeline'),
+        child:
+            Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+          const Text('Approval audit timeline',
+              style: TextStyle(fontSize: 17, fontWeight: FontWeight.w700)),
+          if (board.auditLogs.isEmpty)
+            const _InlineEmpty(
+                message:
+                    'No persistent proposal audit records have been returned.')
+          else
+            for (final audit in board.auditLogs) _auditTile(audit),
+        ]),
+      ),
+    ]);
+  }
+
+  Widget _approvalProposalCard(ApprovalProposal proposal, int currentVersion) {
+    final isPending = proposal.status == ProposalStatus.pending;
+    final isOutdated = isPending &&
+        (proposal.isStale || proposal.snapshotVersion != currentVersion);
+    final isSelf = proposal.createdBy == widget.uid;
+    final submitting = _decisionSubmitting.contains(proposal.proposalId);
+    final pendingRequest = _pendingDecisions[proposal.proposalId];
+    final decisionError = _decisionErrors[proposal.proposalId];
+    final decisionMessage = _decisionMessages[proposal.proposalId];
+    final statusColor = switch (proposal.status) {
+      ProposalStatus.pending => const Color(0xFFFFC266),
+      ProposalStatus.approved => const Color(0xFF54D39A),
+      ProposalStatus.rejected => const Color(0xFFFF7777),
+    };
+    return _SectionCard(
+      key: Key('proposal-card-${proposal.proposalId}'),
+      child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+        Wrap(
+            spacing: 8,
+            runSpacing: 8,
+            crossAxisAlignment: WrapCrossAlignment.center,
+            children: [
+              Text('Proposal ${proposal.proposalId}',
+                  style: const TextStyle(
+                      fontSize: 16, fontWeight: FontWeight.w700)),
+              _StatusChip(
+                  label: proposal.status.wireValue.toUpperCase(),
+                  color: statusColor),
+              if (isOutdated)
+                const _StatusChip(label: 'OUTDATED', color: Color(0xFFFF7777)),
+            ]),
+        const SizedBox(height: 10),
+        Text(proposal.recommendation.title,
+            style: const TextStyle(fontWeight: FontWeight.w700)),
+        const SizedBox(height: 8),
+        Wrap(spacing: 16, runSpacing: 8, children: [
+          _DetailValue('Order', proposal.orderId),
+          _DetailValue('Material', proposal.recommendation.materialId),
+          _DetailValue('Supplier', proposal.recommendation.supplierId),
+          _DetailValue('Quantity', '${proposal.recommendation.quantity}'),
+          _DetailValue('Created', _formatTimestamp(proposal.createdAt)),
+          _DetailValue('Proposal snapshot', 'v${proposal.snapshotVersion}'),
+          _DetailValue('Current snapshot', 'v$currentVersion'),
+        ]),
+        const SizedBox(height: 10),
+        Text(proposal.recommendation.explanation),
+        if (proposal.recommendation.evidence.isNotEmpty) ...[
+          const SizedBox(height: 10),
+          const Text('Recommendation evidence',
+              style: TextStyle(fontWeight: FontWeight.w700)),
+          for (final evidence in proposal.recommendation.evidence)
+            _BulletText(text: evidence),
+        ],
+        if (proposal.recommendation.assumptions.isNotEmpty) ...[
+          const SizedBox(height: 8),
+          const Text('Demonstration assumptions',
+              style: TextStyle(fontWeight: FontWeight.w700)),
+          for (final assumption in proposal.recommendation.assumptions)
+            _BulletText(text: assumption),
+        ],
+        const SizedBox(height: 12),
+        _simulationCard(proposal.simulation, proposal.recommendationId),
+        if (proposal.decidedAt != null || proposal.decisionReason != null) ...[
+          const SizedBox(height: 10),
+          _SectionCard(
+            padding: const EdgeInsets.all(12),
+            child:
+                Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              Text(
+                  'Decision by ${proposal.decidedBy ?? 'unknown actor'}${proposal.decidedAt == null ? '' : ' · ${_formatTimestamp(proposal.decidedAt!)}'}'),
+              if (proposal.decisionReason != null) ...[
+                const SizedBox(height: 5),
+                Text('Reason: ${proposal.decisionReason}')
+              ],
+            ]),
+          ),
+        ],
+        if (proposal.executionStatus == ProposalExecutionStatus.demoPoCreated)
+          const _InlineNotice(
+              'A demonstration purchase order was created. It is not a real supplier transaction.'),
+        if (proposal.executionStatus ==
+            ProposalExecutionStatus.awaitingSupplierConfirmation)
+          const _InlineNotice(
+              'Expedite authorization is awaiting supplier confirmation; delivery dates have not been changed.'),
+        if (isPending && widget.role == 'approver') ...[
+          const SizedBox(height: 12),
+          if (isSelf)
+            const _InlineNotice(
+                'You submitted this proposal and cannot approve it.'),
+          if (isOutdated)
+            const _InlineErrorMessage(
+                'This pending proposal is stale. Approval is disabled; ask the planner to submit a fresh proposal.'),
+          Wrap(spacing: 10, runSpacing: 8, children: [
+            if (!isSelf)
+              FilledButton.icon(
+                key: Key('approve-proposal-${proposal.proposalId}'),
+                onPressed: submitting || isOutdated || _snapshotStale
+                    ? null
+                    : () => _beginProposalDecision(proposal, 'approve'),
+                icon: const Icon(Icons.check_circle_outline),
+                label: const Text('Approve'),
+              ),
+            OutlinedButton.icon(
+              key: Key('reject-proposal-${proposal.proposalId}'),
+              onPressed: submitting || _snapshotStale
+                  ? null
+                  : () => _beginProposalDecision(proposal, 'reject'),
+              icon: const Icon(Icons.cancel_outlined),
+              label: const Text('Reject'),
+            ),
+            if (submitting)
+              const SizedBox(
+                  width: 18,
+                  height: 18,
+                  child: CircularProgressIndicator(strokeWidth: 2)),
+          ]),
+          if (pendingRequest != null && decisionError != null && !submitting)
+            TextButton.icon(
+              key: Key('retry-decision-${proposal.proposalId}'),
+              onPressed: () => _retryProposalDecision(proposal),
+              icon: const Icon(Icons.refresh),
+              label: Text('Retry ${pendingRequest.decision} with same request'),
+            ),
+        ],
+        if (decisionError != null) ...[
+          const SizedBox(height: 8),
+          _InlineErrorMessage(decisionError)
+        ],
+        if (decisionMessage != null) ...[
+          const SizedBox(height: 8),
+          _InlineNotice(decisionMessage)
+        ],
+      ]),
+    );
+  }
+
+  Widget _purchaseOrderTile(DemoPurchaseOrder po) => Container(
+        key: Key('purchase-order-${po.purchaseOrderId}'),
+        margin: const EdgeInsets.only(top: 10),
+        padding: const EdgeInsets.all(12),
+        decoration: BoxDecoration(
+            color: const Color(0xFF1A2025),
+            borderRadius: BorderRadius.circular(12),
+            border: Border.all(color: const Color(0xFF54D39A).withAlpha(80))),
+        child:
+            Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+          Wrap(spacing: 8, runSpacing: 6, children: [
+            Text(po.purchaseOrderId,
+                style: const TextStyle(fontWeight: FontWeight.w700)),
+            const _StatusChip(label: 'DEMO ONLY', color: Color(0xFFFFC266)),
+            _StatusChip(
+                label: po.status.toUpperCase(), color: const Color(0xFF54D39A)),
+          ]),
+          const SizedBox(height: 8),
+          Wrap(spacing: 16, runSpacing: 8, children: [
+            _DetailValue('Proposal', po.proposalId),
+            _DetailValue('Order', po.orderId),
+            _DetailValue('Supplier', po.supplierId),
+            _DetailValue('Material', po.materialId),
+            _DetailValue('Quantity', '${po.quantity}'),
+            _DetailValue(
+                'Expected delivery', _formatDate(po.expectedDeliveryDate)),
+            _DetailValue(
+                'Cost', _costText(po.estimatedIncrementalCost, po.currency)),
+          ]),
+          const SizedBox(height: 6),
+          Text(
+              'Created ${_formatTimestamp(po.createdAt)} · Simulated demonstration record; no real supplier was contacted.'),
+        ]),
+      );
+
+  Widget _auditTile(ApprovalAuditRecord audit) {
+    final color = switch (audit.action) {
+      'proposal_submitted' => const Color(0xFF9B78FF),
+      'proposal_approved' ||
+      'purchase_order_created' ||
+      'expedite_authorized' =>
+        const Color(0xFF54D39A),
+      'proposal_rejected' => const Color(0xFFFF7777),
+      _ => const Color(0xFFB5B6BE),
+    };
+    return ListTile(
+      key: Key('audit-${audit.auditId}'),
+      contentPadding: EdgeInsets.zero,
+      leading: Icon(
+          switch (audit.action) {
+            'proposal_submitted' => Icons.outgoing_mail,
+            'proposal_approved' => Icons.verified_outlined,
+            'proposal_rejected' => Icons.block_outlined,
+            'purchase_order_created' => Icons.receipt_long_outlined,
+            'expedite_authorized' => Icons.local_shipping_outlined,
+            _ => Icons.history,
+          },
+          color: color),
+      title: Text(audit.summary),
+      subtitle: Text(
+          '${audit.auditId} · ${_titleCase(audit.action)} · ${_titleCase(audit.actorRole)} · ${_formatTimestamp(audit.timestamp)} · ${audit.proposalId} · v${audit.version}'),
+    );
+  }
+
+  String _formatTimestamp(DateTime dateTime) {
+    final local = dateTime.toLocal();
+    return '${_formatDate(local)} ${_formatTime(local)}';
   }
 
   Widget _eventCard(double width, String title, Widget child) => SizedBox(
@@ -1864,9 +2493,74 @@ class _DashboardScreenState extends State<DashboardScreen> {
               style: const TextStyle(color: Color(0xFFFFC266)),
             ),
           _simulationCard(simulation, recommendation.recommendationId),
+          const SizedBox(height: 10),
+          if (widget.role == 'planner')
+            _proposalSubmissionControl(order, recommendation, simulation,
+                outdated: outdated || simulationOutdated),
         ],
       ]),
     );
+  }
+
+  Widget _proposalSubmissionControl(
+    CustomerOrder order,
+    InventoryRecommendation recommendation,
+    SimulationResult simulation, {
+    required bool outdated,
+  }) {
+    final key = recommendation.recommendationId;
+    final currentVersion = _snapshot?.version;
+    final alreadySubmitted = _approvalBoard?.proposals.any((proposal) =>
+            proposal.recommendationId == recommendation.recommendationId &&
+            proposal.snapshotVersion == currentVersion) ??
+        false;
+    final submitting = _proposalSubmitting.contains(key);
+    final error = _proposalErrors[key];
+    final message = _proposalMessages[key];
+    return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+      FilledButton.icon(
+        key: Key('submit-proposal-$key'),
+        onPressed: currentVersion == null ||
+                outdated ||
+                _snapshotStale ||
+                submitting ||
+                alreadySubmitted
+            ? null
+            : () => _submitProposal(order, recommendation, simulation),
+        icon: submitting
+            ? const SizedBox(
+                width: 16,
+                height: 16,
+                child: CircularProgressIndicator(strokeWidth: 2))
+            : const Icon(Icons.outgoing_mail),
+        label: Text(submitting
+            ? 'Submitting…'
+            : alreadySubmitted
+                ? 'Already submitted for this version'
+                : 'Submit for Approval'),
+      ),
+      if (outdated)
+        const Padding(
+          padding: EdgeInsets.only(top: 6),
+          child: Text(
+              'Regenerate and simulate this option for the current snapshot before submission.',
+              style: TextStyle(color: Color(0xFFFFC266))),
+        ),
+      if (error != null) ...[
+        const SizedBox(height: 8),
+        _InlineErrorMessage(error),
+        if (!outdated && !_snapshotStale && !submitting)
+          TextButton(
+            key: Key('retry-proposal-$key'),
+            onPressed: () => _submitProposal(order, recommendation, simulation),
+            child: const Text('Retry proposal submission'),
+          ),
+      ],
+      if (message != null) ...[
+        const SizedBox(height: 8),
+        _InlineNotice(message),
+      ],
+    ]);
   }
 
   Widget _simulationCard(
@@ -2011,6 +2705,99 @@ class _DashboardScreenState extends State<DashboardScreen> {
     if (cost == null) return 'Not available';
     final amount = cost is int ? '$cost' : cost.toStringAsFixed(2);
     return currency == null ? amount : '$currency $amount';
+  }
+}
+
+class _ProposalDecisionDialog extends StatefulWidget {
+  const _ProposalDecisionDialog({
+    required this.proposal,
+    required this.currentVersion,
+    required this.decision,
+  });
+
+  final ApprovalProposal proposal;
+  final int currentVersion;
+  final String decision;
+
+  @override
+  State<_ProposalDecisionDialog> createState() =>
+      _ProposalDecisionDialogState();
+}
+
+class _ProposalDecisionDialogState extends State<_ProposalDecisionDialog> {
+  final _reasonController = TextEditingController();
+  bool _acknowledged = false;
+
+  @override
+  void dispose() {
+    _reasonController.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final proposal = widget.proposal;
+    final approving = widget.decision == 'approve';
+    return AlertDialog(
+      scrollable: true,
+      title: Text(approving ? 'Approve proposal?' : 'Reject proposal?'),
+      content: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Text('Proposal ${proposal.proposalId} · Order ${proposal.orderId}'),
+          const SizedBox(height: 8),
+          Text(proposal.recommendation.title,
+              style: const TextStyle(fontWeight: FontWeight.w700)),
+          const SizedBox(height: 8),
+          Text(
+              'Snapshot v${proposal.snapshotVersion} · Current v${widget.currentVersion}'),
+          const SizedBox(height: 12),
+          TextField(
+            key: Key('decision-reason-${proposal.proposalId}'),
+            controller: _reasonController,
+            onChanged: (_) => setState(() {}),
+            minLines: 2,
+            maxLines: 4,
+            maxLength: 500,
+            decoration: const InputDecoration(
+              labelText: 'Decision reason (required)',
+              alignLabelWithHint: true,
+              border: OutlineInputBorder(),
+            ),
+          ),
+          if (approving) ...[
+            const SizedBox(height: 8),
+            const Text(
+                'Approval may authorize a simulated demo purchase order or an expedite request awaiting supplier confirmation. No real supplier contact or external purchase occurs.'),
+            CheckboxListTile(
+              key: Key('acknowledge-demo-${proposal.proposalId}'),
+              contentPadding: EdgeInsets.zero,
+              value: _acknowledged,
+              onChanged: (value) =>
+                  setState(() => _acknowledged = value ?? false),
+              controlAffinity: ListTileControlAffinity.leading,
+              title: const Text(
+                  'I acknowledge the synthetic demonstration supplier assumptions.'),
+            ),
+          ],
+        ],
+      ),
+      actions: [
+        TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('Cancel')),
+        FilledButton(
+          key: Key('confirm-decision-${proposal.proposalId}'),
+          onPressed: _reasonController.text.trim().isEmpty ||
+                  (approving && !_acknowledged)
+              ? null
+              : () => Navigator.pop(
+                  context, (_reasonController.text.trim(), _acknowledged)),
+          child: Text(approving ? 'Confirm approval' : 'Confirm rejection'),
+        ),
+      ],
+    );
   }
 }
 
@@ -2297,6 +3084,45 @@ class _InlineErrorMessage extends StatelessWidget {
           border: Border.all(color: const Color(0xFFFF7777).withAlpha(90)),
         ),
         child: Text(message, style: const TextStyle(color: Color(0xFFFFA0A0))),
+      );
+}
+
+class _InlineNotice extends StatelessWidget {
+  const _InlineNotice(this.message);
+
+  final String message;
+
+  @override
+  Widget build(BuildContext context) => Container(
+        key: Key('notice-${message.hashCode}'),
+        margin: const EdgeInsets.only(top: 8),
+        padding: const EdgeInsets.all(11),
+        decoration: BoxDecoration(
+          color: const Color(0xFF1C3029),
+          borderRadius: BorderRadius.circular(10),
+          border: Border.all(color: const Color(0xFF54D39A).withAlpha(80)),
+        ),
+        child: Text(message, style: const TextStyle(color: Color(0xFF9AE4C0))),
+      );
+}
+
+class _StatusChip extends StatelessWidget {
+  const _StatusChip({required this.label, required this.color});
+
+  final String label;
+  final Color color;
+
+  @override
+  Widget build(BuildContext context) => Container(
+        padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 5),
+        decoration: BoxDecoration(
+          color: color.withAlpha(28),
+          borderRadius: BorderRadius.circular(20),
+          border: Border.all(color: color.withAlpha(100)),
+        ),
+        child: Text(label,
+            style: TextStyle(
+                color: color, fontSize: 10, fontWeight: FontWeight.w800)),
       );
 }
 
