@@ -6,7 +6,7 @@ from google.auth.exceptions import GoogleAuthError
 from google.cloud.firestore import transactional
 from pydantic import ValidationError
 
-from app.firebase_service import FirebaseUnavailable, firestore_client
+from app.firebase_service import FirebaseUnavailable, firestore_client, log_firebase_failure
 from app.inventory.demo import demo_inventory
 from app.inventory.events import DemoState, Event, EventError, EventResult, apply_event
 
@@ -55,7 +55,8 @@ class FirestoreInventoryStore:
             if not snapshot.exists:
                 raise StateUnavailable("Demo inventory has not been initialized.")
             return DemoState.model_validate(snapshot.to_dict())
-        except (*FIRESTORE_ERRORS, ValidationError):
+        except (*FIRESTORE_ERRORS, ValidationError) as error:
+            log_firebase_failure("read_inventory", error)
             raise StateUnavailable("Demo inventory is unavailable.") from None
 
     def submit(self, event: Event, actor_uid: str) -> EventResult:

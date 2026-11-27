@@ -4,6 +4,7 @@ import re
 from google.cloud.firestore import transactional
 
 from app.auth import AuthenticatedUser
+from app.firebase_service import log_firebase_failure
 from app.inventory.events import DemoState, EventError
 from app.inventory.proposal_models import (
     AuditEntry, DecisionRequest, DecisionResponse, Proposal, ProposalList, ProposalResponse, PurchaseOrder,
@@ -131,6 +132,9 @@ class FirestoreProposalStore(FirestoreInventoryStore):
             raise StateUnavailable("Proposal storage is unavailable.") from None
 
     def list_proposals(self) -> ProposalList:
+        return self.read_with_proposals()[1]
+
+    def read_with_proposals(self) -> tuple[DemoState, ProposalList]:
         try:
             client, root = self._references()
 
@@ -146,7 +150,7 @@ class FirestoreProposalStore(FirestoreInventoryStore):
                 completed = [item for item in proposals if item.status != "pending"][:HISTORY_LIMIT]
                 orders = root.collection("purchase_orders").order_by("created_at", direction="DESCENDING")
                 audits = root.collection("proposal_audit").order_by("timestamp", direction="DESCENDING")
-                return ProposalList(
+                return state, ProposalList(
                     version=state.version,
                     proposals=tuple(pending + completed),
                     purchase_orders=tuple(
@@ -160,7 +164,8 @@ class FirestoreProposalStore(FirestoreInventoryStore):
                 )
 
             return read(client.transaction(read_only=True))
-        except (*FIRESTORE_ERRORS, ValueError):
+        except (*FIRESTORE_ERRORS, ValueError) as error:
+            log_firebase_failure("read_proposals", error)
             raise StateUnavailable("Proposal storage is unavailable.") from None
 
 

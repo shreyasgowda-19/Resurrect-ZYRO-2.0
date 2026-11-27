@@ -52,3 +52,18 @@ The inventory document has four additional Firestore subcollections.
 The same Firestore transaction persists the decision, audit records, and any PO and inventory updates. All reads occur before writes. The PO contributes incoming supply as confirmed only within the demo model, and the allocator recalculates the whole inventory. Physical stock changes only through existing inventory events. Expedite authorization records the approver's decision while preserving the lot ETA until a confirmation event.
 
 The list endpoint uses one read-only transaction for a consistent inventory version, proposal statuses, and history. It reads all demo proposals so pending proposals cannot be hidden by the 20-record completed history limit. PO and audit displays each show the most recent 20 records. The underlying audit and decision records are retained.
+
+## Read-only AI copilot
+
+The copilot reads inventory and the proposal, purchase order, and audit view in one Firestore read-only transaction. It checks freshness again before responding. A stale question returns HTTP 409. If approvals change at the same inventory version, the copilot renders the refreshed facts locally. Briefings have no client-supplied version and use the refreshed view when it changes.
+
+Gemini receives up to 40 allowlisted manufacturing terms and metadata for up to 24 evidence options. It receives no raw questions, evidence summaries, business values, actor identities, tokens, or credentials in the prompt. It returns one focus label and up to six opaque evidence IDs. The backend rejects unknown or duplicate IDs, unexpected fields, and unsupported focus labels, and renders all answer text from verified evidence. The Gemini request uses an eight-second transport and wall-clock deadline, with one SDK attempt and at most one provider call in flight per process. An immediate provider failure uses the current consistent read for fallback. Successful selections and longer attempts recheck freshness. Uvicorn logs only configuration presence, processing durations, outcome categories, and response mode. Timeouts, quota errors, and invalid responses use deterministic fallback. Missing authoritative data returns HTTP 503.
+
+Recommendation simulations are hypothetical. Demo POs represent simulated supplier commitments. Unknown costs remain unavailable. Event and approval evidence is drawn from the existing bounded recent-history views, and the local question parser supports a limited manufacturing vocabulary. Neither endpoint exposes tools or writes business data.
+
+Use the existing server-side `GEMINI_API_KEY` and `GEMINI_MODEL` configuration. The T0-documented model is `gemini-3.1-flash-lite`. From `backend\` in Windows CMD, run the existing connectivity diagnostic with the key already set privately.
+
+```cmd
+set "GEMINI_MODEL=gemini-3.1-flash-lite"
+.venv\Scripts\python.exe -m scripts.check_gemini
+```
