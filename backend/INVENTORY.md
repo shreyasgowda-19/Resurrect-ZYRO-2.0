@@ -35,3 +35,20 @@ T3 considers at-risk, critical, and delayed orders and offers single actions onl
 - The only modeled alternate capability is explicitly synthetic. Existing demo supplier `SUP-02` can hypothetically supply up to 400 Copper units in four calendar days. The scenario adds a new incoming lot and leaves on-hand stock unchanged. Supplier capacity, willingness, actual lead time, currency, and incremental cost are unverified. Unknown costs and currency are returned as null.
 
 The simulation endpoint rebuilds candidates from the current snapshot before accepting an ID. If an event changes the version, refresh the state and request recommendations again. Each scenario is conditional on the stated assumptions. The endpoints leave Firestore, supplier communications, and purchase-order creation untouched.
+
+## Proposal decisions and demo procurement
+
+Proposals bind the target order, recommendation, and inventory version. Planners submit them without mutating inventory. Approvers review the stored evidence. The server regenerates that evidence for approval against the proposal's original version and the current facts. Only an approval that creates a demo purchase order increments inventory version.
+
+The inventory document has four additional Firestore subcollections.
+
+| Subcollection | Contents |
+| --- | --- |
+| `proposals` | Deterministic proposal records and complete recommendation and simulation evidence |
+| `proposal_decisions` | Normalized decision request, approver UID, and original response for replay |
+| `purchase_orders` | Demo PO, associated incoming lot ID, and explicit synthetic supplier commitment marker |
+| `proposal_audit` | Append-only audit records from backend transactions |
+
+The same Firestore transaction persists the decision, audit records, and any PO and inventory updates. All reads occur before writes. The PO contributes incoming supply as confirmed only within the demo model, and the allocator recalculates the whole inventory. Physical stock changes only through existing inventory events. Expedite authorization records the approver's decision while preserving the lot ETA until a confirmation event.
+
+The list endpoint uses one read-only transaction for a consistent inventory version, proposal statuses, and history. It reads all demo proposals so pending proposals cannot be hidden by the 20-record completed history limit. PO and audit displays each show the most recent 20 records. The underlying audit and decision records are retained.
