@@ -6,6 +6,7 @@ import 'package:flutter/material.dart';
 
 import '../../core/api/api_client.dart';
 import '../../core/models/inventory_snapshot.dart';
+import '../../core/models/ai_copilot_models.dart';
 import '../../core/models/proposal_models.dart';
 import '../../core/models/recommendation_models.dart';
 
@@ -40,6 +41,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
   final _alertsKey = GlobalKey();
   final _historyKey = GlobalKey();
   final _approvalsKey = GlobalKey();
+  final _copilotKey = GlobalKey();
   late final ApiClient _apiClient;
   late final bool _ownsApiClient;
 
@@ -95,6 +97,21 @@ class _DashboardScreenState extends State<DashboardScreen> {
   final Map<String, ProposalDecisionRequest> _pendingDecisions = {};
   final Map<String, String> _decisionErrors = {};
   final Map<String, String> _decisionMessages = {};
+  final _aiQuestionController = TextEditingController();
+  final List<_AiConversationEntry> _aiConversation = [];
+  String? _aiContextOrderId;
+  bool _aiSubmitting = false;
+  bool _aiBriefingInFlight = false;
+  bool _aiBriefingRefreshQueued = false;
+  bool _aiBriefingLoading = false;
+  int _aiRequestSequence = 0;
+  int _aiConversationGeneration = 0;
+  int _aiBriefingSequence = 0;
+  AiBriefing? _aiBriefing;
+  String? _aiBriefingError;
+  String? _aiQuestionError;
+  _AiRetryQuestion? _aiRetryQuestion;
+  String? _approvalDataSignature;
 
   @override
   void initState() {
@@ -116,6 +133,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
     _receiptQuantity.dispose();
     _adjustmentQuantity.dispose();
     _requiredQuantity.dispose();
+    _aiQuestionController.dispose();
     if (_ownsApiClient) _apiClient.close();
     super.dispose();
   }
@@ -129,7 +147,12 @@ class _DashboardScreenState extends State<DashboardScreen> {
       _loading = _snapshot == null;
       _error = null;
     });
-    await Future.wait([_loadSnapshot(), _checkBackend(), _loadProposals()]);
+    await Future.wait([
+      _loadSnapshot(),
+      _checkBackend(),
+      _loadProposals(),
+      _loadAiBriefing(),
+    ]);
   }
 
   Future<void> _loadSnapshot() async {
@@ -161,6 +184,9 @@ class _DashboardScreenState extends State<DashboardScreen> {
         _snapshotStale = false;
         _lastRefreshAt = DateTime.now();
       });
+      if (previousVersion != snapshot.version) {
+        _requestAiBriefingRefresh();
+      }
     } on StateApiException catch (error) {
       if (!mounted || sequence != _requestSequence) return;
       setState(() {
@@ -211,11 +237,15 @@ class _DashboardScreenState extends State<DashboardScreen> {
       final token = await widget.getIdToken();
       final board = await _apiClient.getProposals(idToken: token);
       if (!mounted || sequence != _proposalsRequestSequence) return;
+      final signature = _proposalSignature(board);
+      final proposalDataChanged = _approvalDataSignature != signature;
+      _approvalDataSignature = signature;
       setState(() {
         _approvalBoard = board;
         _approvalError = null;
         _approvalLoading = false;
       });
+      if (proposalDataChanged) _requestAiBriefingRefresh();
     } on ProposalApiException catch (error) {
       if (!mounted || sequence != _proposalsRequestSequence) return;
       setState(() {
@@ -238,6 +268,195 @@ class _DashboardScreenState extends State<DashboardScreen> {
     }
   }
 
+  String _proposalSignature(ApprovalBoard board) => [
+        for (final proposal in board.proposals)
+          '${proposal.proposalId}:${proposal.status.wireValue}:${proposal.isStale}:${proposal.snapshotVersion}',
+        for (final order in board.purchaseOrders)
+          '${order.purchaseOrderId}:${order.status}',
+        for (final record in board.auditLogs)
+          '${record.auditId}:${record.action}:${record.version}',
+      ].join('|');
+
+  void _requestAiBriefingRefresh() {
+    if (_aiBriefingInFlight) {
+      _aiBriefingRefreshQueued = true;
+      return;
+    }
+    unawaited(_loadAiBriefing());
+  }
+
+  Future<void> _loadAiBriefing() async {
+    if (_aiSubmitting) {
+      _aiBriefingRefreshQueued = true;
+      return;
+    }
+    if (_aiBriefingInFlight) return;
+    _aiBriefingInFlight = true;
+    final sequence = ++_aiBriefingSequence;
+    if (mounted && _aiBriefing == null) {
+      setState(() {
+        _aiBriefingLoading = true;
+        _aiBriefingError = null;
+      });
+    }
+    try {
+      final token = await widget.getIdToken();
+      final briefing = await _apiClient.getAiBriefing(idToken: token);
+      if (!mounted || sequence != _aiBriefingSequence) return;
+      if (briefing.role != widget.role) {
+        throw const AiApiException(AiApiFailure.malformedResponse,
+            message: 'The briefing role did not match the verified user role.');
+      }
+      setState(() {
+        _aiBriefing = briefing;
+        _aiBriefingError = null;
+        _aiBriefingLoading = false;
+      });
+    } on AiApiException catch (error) {
+      if (!mounted || sequence != _aiBriefingSequence) return;
+      setState(() {
+        _aiBriefingError = _aiErrorMessage(error);
+        _aiBriefingLoading = false;
+      });
+    } catch (_) {
+      if (!mounted || sequence != _aiBriefingSequence) return;
+      setState(() {
+        _aiBriefingError = 'Manufacturing briefing could not be loaded.';
+        _aiBriefingLoading = false;
+      });
+    } finally {
+      _aiBriefingInFlight = false;
+      if (mounted && _aiBriefingRefreshQueued) {
+        _aiBriefingRefreshQueued = false;
+        scheduleMicrotask(() => _requestAiBriefingRefresh());
+      }
+    }
+  }
+
+  Future<void> _askAi({String? question, String? orderId}) async {
+    if (_aiSubmitting) return;
+    if (_aiBriefingInFlight) {
+      setState(() => _aiQuestionError =
+          'The briefing is refreshing. Wait for it to finish before asking.');
+      return;
+    }
+    final prompt = (question ?? _aiQuestionController.text).trim();
+    if (prompt.isEmpty || prompt.length > 1000) {
+      setState(() =>
+          _aiQuestionError = 'Enter a question between 1 and 1000 characters.');
+      return;
+    }
+    final snapshot = _snapshot;
+    if (snapshot == null) {
+      setState(() => _aiQuestionError =
+          'A current inventory snapshot is required before asking.');
+      return;
+    }
+    if (_snapshotStale) {
+      setState(() => _aiQuestionError =
+          'The inventory snapshot is stale. Refresh successfully before asking.');
+      return;
+    }
+    final contextOrderId = orderId ?? _aiContextOrderId ?? _selectedOrderId;
+    final generation = _aiConversationGeneration;
+    final sequence = ++_aiRequestSequence;
+    setState(() {
+      _aiSubmitting = true;
+      _aiQuestionError = null;
+      _aiRetryQuestion = null;
+      _aiQuestionController.clear();
+    });
+    try {
+      final token = await widget.getIdToken();
+      final answer = await _apiClient.postAiQuestion(
+        idToken: token,
+        question: prompt,
+        orderId: contextOrderId,
+        expectedVersion: snapshot.version,
+      );
+      if (!mounted || sequence != _aiRequestSequence) return;
+      if (answer.role != widget.role) {
+        throw const AiApiException(AiApiFailure.malformedResponse,
+            message: 'The answer role did not match the verified user role.');
+      }
+      if (generation == _aiConversationGeneration) {
+        setState(() {
+          _aiConversation.add(_AiConversationEntry(
+              question: prompt, orderId: contextOrderId, answer: answer));
+        });
+      }
+    } on AiApiException catch (error) {
+      if (!mounted || sequence != _aiRequestSequence) return;
+      setState(() {
+        _aiQuestionError = _aiErrorMessage(error);
+        if (error.failure == AiApiFailure.staleVersion) {
+          _aiRetryQuestion = _AiRetryQuestion(prompt, contextOrderId);
+        }
+      });
+      if (error.failure == AiApiFailure.staleVersion) {
+        await _loadSnapshot();
+      }
+    } catch (_) {
+      if (!mounted || sequence != _aiRequestSequence) return;
+      setState(() => _aiQuestionError =
+          'The AI request could not be completed. Check the connection and retry.');
+    } finally {
+      if (mounted && sequence == _aiRequestSequence) {
+        setState(() => _aiSubmitting = false);
+        if (_aiBriefingRefreshQueued) {
+          _aiBriefingRefreshQueued = false;
+          scheduleMicrotask(() => _requestAiBriefingRefresh());
+        }
+      }
+    }
+  }
+
+  String _aiErrorMessage(AiApiException error) {
+    if (error.message != null && error.message!.isNotEmpty) {
+      return error.message!;
+    }
+    return switch (error.failure) {
+      AiApiFailure.unauthorized => 'Your session expired. Sign in again.',
+      AiApiFailure.forbidden =>
+        'Your verified role cannot access the AI copilot.',
+      AiApiFailure.notFound =>
+        'The requested manufacturing record was not found.',
+      AiApiFailure.staleVersion =>
+        'The snapshot changed. Current data was refreshed; review it and retry manually.',
+      AiApiFailure.validation =>
+        'The question was not accepted. Review it and try again.',
+      AiApiFailure.unavailable => 'Required backend data is unavailable.',
+      AiApiFailure.timeout => 'The AI request timed out. Retry when ready.',
+      AiApiFailure.connectivity => 'The backend could not be reached.',
+      AiApiFailure.malformedResponse =>
+        'The backend returned an invalid AI response.',
+      AiApiFailure.backendError => 'The AI request failed. Retry when ready.',
+    };
+  }
+
+  void _openCopilot({String? orderId, String? question}) {
+    setState(() {
+      _aiContextOrderId = orderId;
+      if (question != null) _aiQuestionController.text = question;
+    });
+    unawaited(_selectSection('copilot'));
+  }
+
+  void _clearAiConversation() {
+    setState(() {
+      _aiConversationGeneration++;
+      _aiConversation.clear();
+      _aiQuestionError = null;
+      _aiRetryQuestion = null;
+    });
+  }
+
+  void _askSuggested(String question, {String? orderId}) {
+    _aiQuestionController.text = question;
+    if (orderId != null) _aiContextOrderId = orderId;
+    unawaited(_askAi(question: question, orderId: orderId));
+  }
+
   Future<void> _selectSection(String section) async {
     setState(() => _selectedSection = section);
     if (_scaffoldKey.currentState?.isDrawerOpen == true) {
@@ -250,6 +469,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
       'alerts' => _alertsKey,
       'history' => _historyKey,
       'approvals' => _approvalsKey,
+      'copilot' => _copilotKey,
       _ => _overviewKey,
     };
     await WidgetsBinding.instance.endOfFrame;
@@ -855,6 +1075,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
                 'alerts', Icons.notifications_active_outlined, 'Risk alerts'),
             _navItem('history', Icons.history, 'Event history'),
             _navItem('approvals', Icons.fact_check_outlined, 'Approvals'),
+            _navItem('copilot', Icons.auto_awesome_outlined, 'AI Copilot'),
             const Spacer(),
             const Divider(color: Color(0xFF303137)),
             Text(widget.email,
@@ -1118,6 +1339,14 @@ class _DashboardScreenState extends State<DashboardScreen> {
                       ),
                       const SizedBox(height: 14),
                       _approvalWorkspace(contentWidth),
+                      const SizedBox(height: 30),
+                      _sectionHeading(
+                        _copilotKey,
+                        'AI Copilot',
+                        'Ask about verified manufacturing data. Answers and evidence come from the authenticated backend.',
+                      ),
+                      const SizedBox(height: 14),
+                      _aiCopilot(contentWidth),
                     ],
                   ],
                 ),
@@ -1160,6 +1389,467 @@ class _DashboardScreenState extends State<DashboardScreen> {
         ]),
       );
 
+  Widget _aiCopilot(double width) {
+    final currentVersion = _snapshot?.version;
+    final briefing = _aiBriefing;
+    final suggestions = <String>[
+      'Which orders need my attention?',
+      'Explain the latest supplier delay.',
+      'How was ORD-1042 recovered?',
+      'Which materials are causing shortages?',
+      'Compare available recovery strategies.',
+      if (widget.role == 'approver') 'Which proposals require approval?',
+    ];
+    return Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+      _SectionCard(
+        child:
+            Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+          Row(children: [
+            const Icon(Icons.insights_outlined, color: Color(0xFF9B78FF)),
+            const SizedBox(width: 9),
+            const Expanded(
+                child: Text('Role-based manufacturing briefing',
+                    style: TextStyle(fontWeight: FontWeight.w700))),
+            IconButton(
+              key: const Key('ai-briefing-refresh'),
+              tooltip: 'Refresh briefing',
+              onPressed: _aiBriefingInFlight || _aiBriefingLoading
+                  ? null
+                  : _loadAiBriefing,
+              icon: const Icon(Icons.refresh),
+            ),
+          ]),
+          if (_aiBriefingLoading && briefing == null)
+            const LinearProgressIndicator()
+          else if (_aiBriefingError != null && briefing == null)
+            Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              _InlineErrorMessage(_aiBriefingError!),
+              TextButton.icon(
+                  onPressed: _aiBriefingInFlight || _aiBriefingLoading
+                      ? null
+                      : _loadAiBriefing,
+                  icon: const Icon(Icons.refresh),
+                  label: const Text('Retry')),
+            ])
+          else if (briefing != null) ...[
+            if (_aiBriefingInFlight) const LinearProgressIndicator(),
+            _aiModeBadge(briefing.mode),
+            const SizedBox(height: 8),
+            if (currentVersion != briefing.version)
+              _aiOutdated(briefing.version, currentVersion),
+            Text(briefing.headline,
+                style:
+                    const TextStyle(fontSize: 17, fontWeight: FontWeight.w700)),
+            const SizedBox(height: 6),
+            Text(briefing.summary),
+            if (briefing.insights.isEmpty)
+              const Padding(
+                padding: EdgeInsets.only(top: 12),
+                child: _InlineEmpty(
+                    message: 'No briefing insights were returned.'),
+              )
+            else ...[
+              const SizedBox(height: 12),
+              for (var index = 0; index < briefing.insights.length; index++)
+                _aiInsightCard(briefing.insights[index], index),
+            ],
+            for (final warning in briefing.warnings) _aiWarning(warning),
+          ],
+        ]),
+      ),
+      const SizedBox(height: 14),
+      _SectionCard(
+        child:
+            Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+          Wrap(
+              alignment: WrapAlignment.spaceBetween,
+              crossAxisAlignment: WrapCrossAlignment.center,
+              spacing: 12,
+              runSpacing: 8,
+              children: [
+                const Text('Manufacturing decision assistant',
+                    style:
+                        TextStyle(fontSize: 17, fontWeight: FontWeight.w700)),
+                Wrap(spacing: 8, children: [
+                  if (_aiContextOrderId != null)
+                    _MetadataChip(
+                        icon: Icons.assignment_outlined,
+                        label: 'Order ${_aiContextOrderId!}',
+                        color: const Color(0xFF9B78FF)),
+                  TextButton.icon(
+                    key: const Key('ai-clear-conversation'),
+                    onPressed:
+                        _aiConversation.isEmpty ? null : _clearAiConversation,
+                    icon: const Icon(Icons.delete_outline, size: 18),
+                    label: const Text('Clear conversation'),
+                  ),
+                ]),
+              ]),
+          const SizedBox(height: 10),
+          Wrap(spacing: 8, runSpacing: 8, children: [
+            for (var i = 0; i < suggestions.length; i++)
+              ActionChip(
+                key: Key('ai-suggestion-$i'),
+                label: Text(suggestions[i]),
+                onPressed: _aiSubmitting || _aiBriefingInFlight
+                    ? null
+                    : () => _askSuggested(suggestions[i],
+                        orderId: _aiContextOrderId),
+              ),
+          ]),
+          const SizedBox(height: 14),
+          Container(
+            key: const Key('ai-conversation-panel'),
+            constraints: const BoxConstraints(minHeight: 100, maxHeight: 360),
+            decoration: BoxDecoration(
+              color: const Color(0xFF17181D),
+              borderRadius: BorderRadius.circular(12),
+              border: Border.all(color: const Color(0xFF303137)),
+            ),
+            child: _aiConversation.isEmpty
+                ? const Center(
+                    child: Padding(
+                    padding: EdgeInsets.all(20),
+                    child: Text(
+                        'Ask a question to explore verified inventory, order, supplier and approval evidence.',
+                        textAlign: TextAlign.center,
+                        style: TextStyle(color: Color(0xFF9B9CA5))),
+                  ))
+                : ListView.builder(
+                    key: const Key('ai-conversation-history'),
+                    padding: const EdgeInsets.all(12),
+                    itemCount: _aiConversation.length,
+                    itemBuilder: (context, index) => _aiConversationCard(
+                        _aiConversation[index], currentVersion),
+                  ),
+          ),
+          if (_aiSubmitting) ...[
+            const SizedBox(height: 8),
+            const LinearProgressIndicator(),
+            const SizedBox(height: 4),
+            const Text('Checking authorized backend evidence…',
+                style: TextStyle(color: Color(0xFF9B9CA5), fontSize: 12)),
+          ],
+          if (_aiQuestionError != null) ...[
+            const SizedBox(height: 10),
+            _InlineErrorMessage(_aiQuestionError!),
+            if (_aiRetryQuestion != null)
+              Align(
+                  alignment: Alignment.centerLeft,
+                  child: TextButton.icon(
+                    key: const Key('ai-manual-retry'),
+                    onPressed:
+                        _aiSubmitting || _aiBriefingInFlight || _snapshotStale
+                            ? null
+                            : () => _askAi(
+                                question: _aiRetryQuestion!.question,
+                                orderId: _aiRetryQuestion!.orderId),
+                    icon: const Icon(Icons.refresh),
+                    label: const Text('Retry with current snapshot'),
+                  )),
+          ],
+          const SizedBox(height: 12),
+          LayoutBuilder(builder: (context, constraints) {
+            final field = TextField(
+              key: const Key('ai-question-input'),
+              controller: _aiQuestionController,
+              minLines: 1,
+              maxLines: 4,
+              maxLength: 1000,
+              enabled: !_aiSubmitting && !_aiBriefingInFlight,
+              decoration: const InputDecoration(
+                hintText: 'Ask about manufacturing operations…',
+                border: OutlineInputBorder(),
+                counterText: '',
+              ),
+              onSubmitted: (_) => _askAi(),
+            );
+            final button = FilledButton.icon(
+              key: const Key('ai-ask-submit'),
+              onPressed:
+                  _aiSubmitting || _aiBriefingInFlight ? null : () => _askAi(),
+              icon: const Icon(Icons.send),
+              label: const Text('Ask AI'),
+            );
+            if (constraints.maxWidth < 560) {
+              return Column(
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [field, const SizedBox(height: 8), button]);
+            }
+            return Row(crossAxisAlignment: CrossAxisAlignment.end, children: [
+              Expanded(child: field),
+              const SizedBox(width: 10),
+              button
+            ]);
+          }),
+          const SizedBox(height: 8),
+          const Text(
+              'Answers are read-only and grounded in backend-provided evidence. Suggested actions never execute automatically.',
+              style: TextStyle(color: Color(0xFF9B9CA5), fontSize: 12)),
+        ]),
+      ),
+    ]);
+  }
+
+  Widget _aiModeBadge(AiResponseMode mode) => Align(
+        alignment: Alignment.centerLeft,
+        child: Padding(
+          padding: const EdgeInsets.only(bottom: 8),
+          child:
+              Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            _StatusChip(
+              label: mode == AiResponseMode.gemini
+                  ? 'Gemini AI'
+                  : 'Evidence-based fallback',
+              color: mode == AiResponseMode.gemini
+                  ? const Color(0xFF9B78FF)
+                  : const Color(0xFFFFC266),
+            ),
+            if (mode == AiResponseMode.deterministicFallback)
+              const Padding(
+                padding: EdgeInsets.only(top: 4),
+                child: Text(
+                  'Uses verified backend data when Gemini is unavailable.',
+                  style: TextStyle(color: Color(0xFFB5B6BE), fontSize: 11),
+                ),
+              ),
+          ]),
+        ),
+      );
+
+  Widget _aiOutdated(int responseVersion, int? currentVersion) => Container(
+        key: Key('ai-outdated-$responseVersion'),
+        margin: const EdgeInsets.only(bottom: 8),
+        padding: const EdgeInsets.all(9),
+        decoration: BoxDecoration(
+            color: const Color(0xFF3A3030),
+            borderRadius: BorderRadius.circular(8)),
+        child: Text(
+            'OUTDATED · response v$responseVersion · current ${currentVersion == null ? 'unavailable' : 'v$currentVersion'}. Ask again to use current data.',
+            style: const TextStyle(color: Color(0xFFFFD99A))),
+      );
+
+  Widget _aiInsightCard(AiInsight insight, int index) => Card(
+        key: ValueKey('ai-insight-$index'),
+        color: const Color(0xFF202127),
+        child: Padding(
+          padding: const EdgeInsets.all(12),
+          child:
+              Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+            Wrap(spacing: 8, runSpacing: 6, children: [
+              _StatusChip(
+                  label: insight.severity.wireValue.toUpperCase(),
+                  color: insight.severity == AiInsightSeverity.critical
+                      ? const Color(0xFFFF7777)
+                      : insight.severity == AiInsightSeverity.warning
+                          ? const Color(0xFFFFC266)
+                          : const Color(0xFF54D39A)),
+              Text(insight.title,
+                  style: const TextStyle(fontWeight: FontWeight.w700)),
+            ]),
+            const SizedBox(height: 5),
+            Text(insight.description),
+            for (var index = 0; index < insight.evidence.length; index++)
+              _aiEvidenceCard(insight.evidence[index], index),
+            Align(
+                alignment: Alignment.centerLeft,
+                child: TextButton.icon(
+                  onPressed: _aiSubmitting || _aiBriefingInFlight
+                      ? null
+                      : () => _askSuggested(insight.suggestedQuestion,
+                          orderId: insight.orderId),
+                  icon: const Icon(Icons.chat_bubble_outline, size: 17),
+                  label: const Text('Ask about this insight'),
+                )),
+          ]),
+        ),
+      );
+
+  Widget _aiConversationCard(_AiConversationEntry entry, int? currentVersion) {
+    final stale = _snapshotStale ||
+        (currentVersion != null && entry.answer.version != currentVersion);
+    return Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+      Align(
+          alignment: Alignment.centerRight,
+          child: Container(
+            constraints: const BoxConstraints(maxWidth: 720),
+            margin: const EdgeInsets.only(bottom: 10),
+            padding: const EdgeInsets.all(12),
+            decoration: BoxDecoration(
+                color: const Color(0xFF252631),
+                borderRadius: BorderRadius.circular(12)),
+            child: Text(entry.question, key: const Key('ai-user-question')),
+          )),
+      Container(
+        key: Key('ai-answer-v${entry.answer.version}'),
+        margin: const EdgeInsets.only(bottom: 14),
+        padding: const EdgeInsets.all(12),
+        decoration: BoxDecoration(
+            color: const Color(0xFF202127),
+            borderRadius: BorderRadius.circular(12),
+            border: Border.all(color: const Color(0xFF34353D))),
+        child:
+            Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+          Wrap(spacing: 8, runSpacing: 6, children: [
+            _aiModeBadge(entry.answer.mode),
+            _MetadataChip(
+                icon: Icons.tag,
+                label: 'Snapshot v${entry.answer.version}',
+                color: const Color(0xFFB5B6BE)),
+            if (entry.orderId != null)
+              _MetadataChip(
+                  icon: Icons.assignment_outlined,
+                  label: entry.orderId!,
+                  color: const Color(0xFF9B78FF)),
+          ]),
+          if (stale) _aiOutdated(entry.answer.version, currentVersion),
+          SelectableText(entry.answer.answer, key: const Key('ai-answer-text')),
+          if (entry.answer.evidence.isNotEmpty) ...[
+            const SizedBox(height: 10),
+            const Text('Backend evidence',
+                style: TextStyle(fontWeight: FontWeight.w700)),
+            for (var index = 0; index < entry.answer.evidence.length; index++)
+              _aiEvidenceCard(entry.answer.evidence[index], index),
+          ],
+          for (final warning in entry.answer.warnings) _aiWarning(warning),
+          if (entry.answer.suggestedQuestions.isNotEmpty) ...[
+            const SizedBox(height: 8),
+            const Text('Suggested follow-up questions',
+                style: TextStyle(fontWeight: FontWeight.w700)),
+            Wrap(spacing: 8, runSpacing: 6, children: [
+              for (final question in entry.answer.suggestedQuestions)
+                ActionChip(
+                    label: Text(question),
+                    onPressed: _aiSubmitting || _aiBriefingInFlight
+                        ? null
+                        : () =>
+                            _askSuggested(question, orderId: entry.orderId)),
+            ]),
+          ],
+        ]),
+      ),
+    ]);
+  }
+
+  Widget _aiEvidenceCard(AiEvidence evidence, int index) => Card(
+        key: ValueKey('ai-evidence-$index'),
+        color: const Color(0xFF191A20),
+        child: ListTile(
+          dense: true,
+          contentPadding:
+              const EdgeInsets.symmetric(horizontal: 10, vertical: 2),
+          title: Wrap(spacing: 8, runSpacing: 4, children: [
+            _StatusChip(
+                label:
+                    '${evidence.sourceType.wireValue} · ${_evidenceCategory(evidence.sourceType)}',
+                color: _evidenceColor(evidence.sourceType)),
+            Text(evidence.sourceId,
+                style: const TextStyle(fontWeight: FontWeight.w700)),
+          ]),
+          subtitle: Padding(
+              padding: const EdgeInsets.only(top: 5),
+              child: Text(evidence.summary)),
+          trailing: _evidenceSection(evidence) == null
+              ? null
+              : IconButton(
+                  tooltip: 'Open related dashboard section',
+                  onPressed: () => _openEvidence(evidence),
+                  icon: const Icon(Icons.open_in_new, size: 18)),
+        ),
+      );
+
+  Color _evidenceColor(AiEvidenceSource source) => switch (source) {
+        AiEvidenceSource.inventory ||
+        AiEvidenceSource.order =>
+          const Color(0xFF54D39A),
+        AiEvidenceSource.supplier ||
+        AiEvidenceSource.alert =>
+          const Color(0xFFFFC266),
+        AiEvidenceSource.event ||
+        AiEvidenceSource.audit =>
+          const Color(0xFF9B78FF),
+        AiEvidenceSource.recommendation ||
+        AiEvidenceSource.simulation =>
+          const Color(0xFF67B7FF),
+        AiEvidenceSource.proposal ||
+        AiEvidenceSource.purchaseOrder =>
+          const Color(0xFFFF9D66),
+      };
+
+  String _evidenceCategory(AiEvidenceSource source) => switch (source) {
+        AiEvidenceSource.inventory ||
+        AiEvidenceSource.order ||
+        AiEvidenceSource.supplier =>
+          'verified current fact',
+        AiEvidenceSource.event ||
+        AiEvidenceSource.alert ||
+        AiEvidenceSource.audit =>
+          'historical record',
+        AiEvidenceSource.recommendation ||
+        AiEvidenceSource.simulation =>
+          'hypothetical',
+        AiEvidenceSource.proposal => 'approval record',
+        AiEvidenceSource.purchaseOrder => 'approved demo action',
+      };
+
+  String? _evidenceSection(AiEvidence evidence) =>
+      switch (evidence.sourceType) {
+        AiEvidenceSource.inventory => 'materials',
+        AiEvidenceSource.order || AiEvidenceSource.alert => 'orders',
+        AiEvidenceSource.event => 'history',
+        AiEvidenceSource.proposal ||
+        AiEvidenceSource.purchaseOrder ||
+        AiEvidenceSource.audit =>
+          'approvals',
+        AiEvidenceSource.supplier => 'materials',
+        AiEvidenceSource.recommendation ||
+        AiEvidenceSource.simulation =>
+          'orders',
+      };
+
+  void _openEvidence(AiEvidence evidence) {
+    if (evidence.sourceType == AiEvidenceSource.order ||
+        evidence.sourceType == AiEvidenceSource.alert) {
+      String? orderId;
+      if (evidence.sourceType == AiEvidenceSource.alert) {
+        for (final alert in _snapshot?.alerts ?? const <RiskAlert>[]) {
+          if (alert.alertId == evidence.sourceId) {
+            orderId = alert.orderId;
+            break;
+          }
+        }
+      } else {
+        orderId = evidence.sourceId;
+      }
+      final found = orderId != null &&
+          (_snapshot?.orders.any((order) => order.orderId == orderId) ?? false);
+      if (found) setState(() => _selectedOrderId = orderId);
+    }
+    if (evidence.sourceType == AiEvidenceSource.proposal) {
+      final proposalExists = _approvalBoard?.proposals
+              .any((proposal) => proposal.proposalId == evidence.sourceId) ??
+          false;
+      if (!proposalExists) return;
+    }
+    final section = _evidenceSection(evidence);
+    if (section != null) unawaited(_selectSection(section));
+  }
+
+  Widget _aiWarning(String warning) => Container(
+        margin: const EdgeInsets.only(top: 8),
+        padding: const EdgeInsets.all(9),
+        decoration: BoxDecoration(
+            color: const Color(0xFF332D25),
+            borderRadius: BorderRadius.circular(8)),
+        child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          const Icon(Icons.info_outline, size: 17, color: Color(0xFFFFC266)),
+          const SizedBox(width: 8),
+          Expanded(
+              child: Text(warning,
+                  style: const TextStyle(color: Color(0xFFFFD99A)))),
+        ]),
+      );
+
   Widget _riskAlerts(InventorySnapshot snapshot) => snapshot.alerts.isEmpty
       ? const _SectionCard(
           child:
@@ -1173,29 +1863,37 @@ class _DashboardScreenState extends State<DashboardScreen> {
                   ? const Color(0xFF3A252B)
                   : null,
               child: ListTile(
-                  onTap: () {
-                    setState(() {
-                      _selectedOrderId = alert.orderId;
-                      _newAlertIds.remove(alert.alertId);
-                    });
-                    final target = _ordersKey.currentContext;
-                    if (target != null) {
-                      unawaited(Scrollable.ensureVisible(target,
-                          duration: const Duration(milliseconds: 180)));
-                    }
-                  },
-                  leading: Icon(Icons.notifications_active_outlined,
-                      color: _riskColor(alert.newRisk)),
-                  title: Row(children: [
-                    Expanded(child: Text('Risk escalation · ${alert.orderId}')),
-                    if (_newAlertIds.contains(alert.alertId))
-                      const Chip(label: Text('NEW'))
-                  ]),
-                  subtitle: Text(
-                      '${alert.previousRisk.label} → ${alert.newRisk.label} · ${alert.message}\nEvent ${alert.eventId} · snapshot v${alert.version}'),
-                  isThreeLine: true,
-                  trailing: Icon(Icons.chevron_right,
-                      color: _riskColor(alert.newRisk))),
+                onTap: () {
+                  setState(() {
+                    _selectedOrderId = alert.orderId;
+                    _newAlertIds.remove(alert.alertId);
+                  });
+                  final target = _ordersKey.currentContext;
+                  if (target != null) {
+                    unawaited(Scrollable.ensureVisible(target,
+                        duration: const Duration(milliseconds: 180)));
+                  }
+                },
+                leading: Icon(Icons.notifications_active_outlined,
+                    color: _riskColor(alert.newRisk)),
+                title: Row(children: [
+                  Expanded(child: Text('Risk escalation · ${alert.orderId}')),
+                  if (_newAlertIds.contains(alert.alertId))
+                    const Chip(label: Text('NEW'))
+                ]),
+                subtitle: Text(
+                    '${alert.previousRisk.label} → ${alert.newRisk.label} · ${alert.message}\nEvent ${alert.eventId} · snapshot v${alert.version}'),
+                isThreeLine: true,
+                trailing: IconButton(
+                    key: Key('explain-alert-${alert.alertId}'),
+                    tooltip: 'Explain with AI',
+                    onPressed: () => _openCopilot(
+                        orderId: alert.orderId,
+                        question:
+                            'Explain the risk alert for ${alert.orderId} triggered by event ${alert.eventId}.'),
+                    icon: Icon(Icons.auto_awesome_outlined,
+                        color: _riskColor(alert.newRisk))),
+              ),
             ),
         ]);
 
@@ -1750,6 +2448,17 @@ class _DashboardScreenState extends State<DashboardScreen> {
         ],
         const SizedBox(height: 12),
         _simulationCard(proposal.simulation, proposal.recommendationId),
+        Align(
+            alignment: Alignment.centerLeft,
+            child: OutlinedButton.icon(
+              key: Key('ask-ai-proposal-${proposal.proposalId}'),
+              onPressed: () => _openCopilot(
+                  orderId: proposal.orderId,
+                  question:
+                      'Explain proposal ${proposal.proposalId} for order ${proposal.orderId} using its evidence and current status.'),
+              icon: const Icon(Icons.auto_awesome_outlined),
+              label: const Text('Ask AI about this proposal'),
+            )),
         if (proposal.decidedAt != null || proposal.decisionReason != null) ...[
           const SizedBox(height: 10),
           _SectionCard(
@@ -2204,6 +2913,18 @@ class _DashboardScreenState extends State<DashboardScreen> {
                     : '${selected.slackDays}'),
           ]),
           const SizedBox(height: 15),
+          Align(
+              alignment: Alignment.centerLeft,
+              child: OutlinedButton.icon(
+                key: Key('ask-ai-order-${selected.orderId}'),
+                onPressed: () => _openCopilot(
+                    orderId: selected.orderId,
+                    question:
+                        'Explain the current manufacturing status of ${selected.orderId}.'),
+                icon: const Icon(Icons.auto_awesome_outlined),
+                label: const Text('Ask AI about this order'),
+              )),
+          const SizedBox(height: 10),
           if (selected.shortages.isEmpty)
             const _InlineEmpty(
                 message: 'No material shortages reported for this order.')
@@ -2799,6 +3520,24 @@ class _ProposalDecisionDialogState extends State<_ProposalDecisionDialog> {
       ],
     );
   }
+}
+
+class _AiConversationEntry {
+  const _AiConversationEntry({
+    required this.question,
+    required this.orderId,
+    required this.answer,
+  });
+
+  final String question;
+  final String? orderId;
+  final AiAnswer answer;
+}
+
+class _AiRetryQuestion {
+  const _AiRetryQuestion(this.question, this.orderId);
+  final String question;
+  final String? orderId;
 }
 
 class _OverviewCardData {
