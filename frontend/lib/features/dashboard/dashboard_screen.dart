@@ -32,7 +32,13 @@ class DashboardScreen extends StatefulWidget {
   State<DashboardScreen> createState() => _DashboardScreenState();
 }
 
-class _DashboardScreenState extends State<DashboardScreen> {
+class _DashboardScreenState extends State<DashboardScreen>
+    with WidgetsBindingObserver {
+  static const _statePollInterval = Duration(seconds: 10);
+  static const _proposalsPollInterval = Duration(seconds: 15);
+  static const _maximumRetryDelay = Duration(seconds: 30);
+  static const _maximumRetryExponent = 4;
+
   final _scaffoldKey = GlobalKey<ScaffoldState>();
   final _overviewKey = GlobalKey();
   final _materialsKey = GlobalKey();
@@ -55,11 +61,18 @@ class _DashboardScreenState extends State<DashboardScreen> {
   OrderRisk? _riskFilter;
   String? _selectedOrderId;
   String _selectedSection = 'overview';
-  Timer? _pollTimer;
+  Timer? _statePollTimer;
+  Timer? _proposalsPollTimer;
+  Timer? _stateRetryTimer;
+  Timer? _proposalsRetryTimer;
+  int _stateRetryAttempt = 0;
+  int _proposalsRetryAttempt = 0;
+  bool _appIsActive = true;
   bool _requestInFlight = false;
   bool _refreshQueued = false;
   int _requestSequence = 0;
   bool _snapshotStale = false;
+  bool _snapshotRefreshing = false;
   DateTime? _lastRefreshAt;
   bool _submittingEvent = false;
   String? _eventMessage;
@@ -87,6 +100,10 @@ class _DashboardScreenState extends State<DashboardScreen> {
   ApprovalBoard? _approvalBoard;
   String? _approvalError;
   bool _approvalLoading = false;
+  bool _approvalStale = false;
+  bool _proposalsRefreshing = false;
+  int _proposalRefreshSuccessCount = 0;
+  DateTime? _lastProposalsRefreshAt;
   bool _proposalsRequestInFlight = false;
   int _proposalsRequestSequence = 0;
   bool _proposalsRefreshQueued = false;
@@ -116,20 +133,98 @@ class _DashboardScreenState extends State<DashboardScreen> {
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     _ownsApiClient = widget.apiClient == null;
     _apiClient = widget.apiClient ?? ApiClient();
     _refresh();
-    _pollTimer = Timer.periodic(const Duration(seconds: 5), (_) {
-      if (mounted) {
-        if (!_requestInFlight) unawaited(_loadSnapshot());
-        if (!_proposalsRequestInFlight) unawaited(_loadProposals());
+    _startPolling();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    final active = state == AppLifecycleState.resumed;
+    if (_appIsActive == active) return;
+    _appIsActive = active;
+    if (active) {
+      _startPolling();
+      unawaited(_refreshAfterResume());
+    } else {
+      _stopPolling();
+    }
+  }
+
+  Future<void> _refreshAfterResume() async {
+    final previousProposalSuccesses = _proposalRefreshSuccessCount;
+    await _refresh();
+    if (!mounted ||
+        !_appIsActive ||
+        _proposalRefreshSuccessCount != previousProposalSuccesses ||
+        _approvalError != null) {
+      return;
+    }
+    await _loadProposals();
+  }
+
+  void _startPolling() {
+    if (!mounted || !_appIsActive) return;
+    _statePollTimer ??= Timer.periodic(_statePollInterval, (_) {
+      if (_stateRetryAttempt == 0 && !_requestInFlight) {
+        unawaited(_loadSnapshot());
+      }
+    });
+    _proposalsPollTimer ??= Timer.periodic(_proposalsPollInterval, (_) {
+      if (_proposalsRetryAttempt == 0 && !_proposalsRequestInFlight) {
+        unawaited(_loadProposals());
+      }
+    });
+  }
+
+  void _stopPolling() {
+    _statePollTimer?.cancel();
+    _statePollTimer = null;
+    _proposalsPollTimer?.cancel();
+    _proposalsPollTimer = null;
+    _stateRetryTimer?.cancel();
+    _stateRetryTimer = null;
+    _proposalsRetryTimer?.cancel();
+    _proposalsRetryTimer = null;
+  }
+
+  Duration _retryDelay(int attempt) {
+    final exponent = (attempt - 1).clamp(0, _maximumRetryExponent).toInt();
+    final seconds = 2 * (1 << exponent);
+    return Duration(
+        seconds: seconds.clamp(0, _maximumRetryDelay.inSeconds).toInt());
+  }
+
+  void _scheduleStateRetry() {
+    if (!mounted || !_appIsActive) return;
+    _stateRetryAttempt++;
+    _stateRetryTimer?.cancel();
+    _stateRetryTimer = Timer(_retryDelay(_stateRetryAttempt), () {
+      _stateRetryTimer = null;
+      if (mounted && _appIsActive) {
+        unawaited(_loadSnapshot(fromRetry: true));
+      }
+    });
+  }
+
+  void _scheduleProposalsRetry() {
+    if (!mounted || !_appIsActive) return;
+    _proposalsRetryAttempt++;
+    _proposalsRetryTimer?.cancel();
+    _proposalsRetryTimer = Timer(_retryDelay(_proposalsRetryAttempt), () {
+      _proposalsRetryTimer = null;
+      if (mounted && _appIsActive) {
+        unawaited(_loadProposals(fromRetry: true));
       }
     });
   }
 
   @override
   void dispose() {
-    _pollTimer?.cancel();
+    WidgetsBinding.instance.removeObserver(this);
+    _stopPolling();
     _receiptQuantity.dispose();
     _adjustmentQuantity.dispose();
     _requiredQuantity.dispose();
@@ -139,12 +234,14 @@ class _DashboardScreenState extends State<DashboardScreen> {
   }
 
   Future<void> _refresh() async {
-    if (_requestInFlight) {
-      _refreshQueued = true;
-      return;
-    }
+    _stateRetryTimer?.cancel();
+    _stateRetryTimer = null;
+    _stateRetryAttempt = 0;
+    _proposalsRetryTimer?.cancel();
+    _proposalsRetryTimer = null;
+    _proposalsRetryAttempt = 0;
     setState(() {
-      _loading = _snapshot == null;
+      _loading = _snapshot == null && !_requestInFlight;
       _error = null;
     });
     await Future.wait([
@@ -155,12 +252,20 @@ class _DashboardScreenState extends State<DashboardScreen> {
     ]);
   }
 
-  Future<void> _loadSnapshot() async {
+  Future<void> _loadSnapshot({bool fromRetry = false}) async {
     if (_requestInFlight) {
       _refreshQueued = true;
       return;
     }
+    if (!fromRetry) {
+      _stateRetryTimer?.cancel();
+      _stateRetryTimer = null;
+      _stateRetryAttempt = 0;
+    }
     _requestInFlight = true;
+    if (mounted && _snapshot != null) {
+      setState(() => _snapshotRefreshing = true);
+    }
     final sequence = ++_requestSequence;
     try {
       final token = await widget.getIdToken();
@@ -178,12 +283,17 @@ class _DashboardScreenState extends State<DashboardScreen> {
             }
             _seenAlertIds.add(alert.alertId);
           }
+          _snapshotStale = false;
+          _lastRefreshAt = DateTime.now();
+        } else {
+          _snapshotStale = true;
         }
         _error = null;
         _loading = false;
-        _snapshotStale = false;
-        _lastRefreshAt = DateTime.now();
       });
+      _stateRetryAttempt = 0;
+      _stateRetryTimer?.cancel();
+      _stateRetryTimer = null;
       if (previousVersion != snapshot.version) {
         _requestAiBriefingRefresh();
       }
@@ -194,6 +304,11 @@ class _DashboardScreenState extends State<DashboardScreen> {
         _loading = false;
         _snapshotStale = _snapshot != null;
       });
+      if (_isTemporaryStateFailure(error)) {
+        _scheduleStateRetry();
+      } else {
+        _stateRetryAttempt = 0;
+      }
     } catch (_) {
       if (!mounted || sequence != _requestSequence) return;
       setState(() {
@@ -201,8 +316,12 @@ class _DashboardScreenState extends State<DashboardScreen> {
         _loading = false;
         _snapshotStale = _snapshot != null;
       });
+      _stateRetryAttempt = 0;
     } finally {
       _requestInFlight = false;
+      if (mounted && _snapshotRefreshing) {
+        setState(() => _snapshotRefreshing = false);
+      }
       if (mounted && _refreshQueued) {
         _refreshQueued = false;
         scheduleMicrotask(() => unawaited(_loadSnapshot()));
@@ -220,12 +339,30 @@ class _DashboardScreenState extends State<DashboardScreen> {
     });
   }
 
-  Future<void> _loadProposals() async {
+  bool _isTemporaryStateFailure(StateApiException error) =>
+      error.failure == StateApiFailure.connectivity ||
+      error.failure == StateApiFailure.timeout ||
+      error.failure == StateApiFailure.unavailable;
+
+  bool _isTemporaryProposalFailure(ProposalApiException error) =>
+      error.failure == ProposalApiFailure.connectivity ||
+      error.failure == ProposalApiFailure.timeout ||
+      error.failure == ProposalApiFailure.unavailable;
+
+  Future<void> _loadProposals({bool fromRetry = false}) async {
     if (_proposalsRequestInFlight) {
       _proposalsRefreshQueued = true;
       return;
     }
+    if (!fromRetry) {
+      _proposalsRetryTimer?.cancel();
+      _proposalsRetryTimer = null;
+      _proposalsRetryAttempt = 0;
+    }
     _proposalsRequestInFlight = true;
+    if (mounted && _approvalBoard != null) {
+      setState(() => _proposalsRefreshing = true);
+    }
     final sequence = ++_proposalsRequestSequence;
     if (mounted && _approvalBoard == null) {
       setState(() {
@@ -244,28 +381,52 @@ class _DashboardScreenState extends State<DashboardScreen> {
         _approvalBoard = board;
         _approvalError = null;
         _approvalLoading = false;
+        _approvalStale = false;
+        _lastProposalsRefreshAt = DateTime.now();
       });
+      _proposalsRetryAttempt = 0;
+      _proposalsRetryTimer?.cancel();
+      _proposalsRetryTimer = null;
+      _proposalRefreshSuccessCount++;
       if (proposalDataChanged) _requestAiBriefingRefresh();
     } on ProposalApiException catch (error) {
       if (!mounted || sequence != _proposalsRequestSequence) return;
       setState(() {
         _approvalError = _proposalErrorMessage(error);
         _approvalLoading = false;
+        _approvalStale = _approvalBoard != null;
       });
+      if (_isTemporaryProposalFailure(error)) {
+        _scheduleProposalsRetry();
+      } else {
+        _proposalsRetryAttempt = 0;
+      }
     } catch (_) {
       if (!mounted || sequence != _proposalsRequestSequence) return;
       setState(() {
         _approvalError =
             'Approval records could not be loaded. Retry the request.';
         _approvalLoading = false;
+        _approvalStale = _approvalBoard != null;
       });
+      _proposalsRetryAttempt = 0;
     } finally {
       _proposalsRequestInFlight = false;
+      if (mounted && _proposalsRefreshing) {
+        setState(() => _proposalsRefreshing = false);
+      }
       if (mounted && _proposalsRefreshQueued) {
         _proposalsRefreshQueued = false;
         scheduleMicrotask(() => unawaited(_loadProposals()));
       }
     }
+  }
+
+  Future<void> _refreshProposals() async {
+    if (mounted && !_approvalLoading) {
+      setState(() => _approvalLoading = true);
+    }
+    await _loadProposals();
   }
 
   String _proposalSignature(ApprovalBoard board) => [
@@ -569,7 +730,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
         _adjustmentQuantity.clear();
         _requiredQuantity.clear();
       });
-      await _loadSnapshot();
+      await Future.wait([_loadSnapshot(), _loadProposals()]);
     } on EventApiException catch (error) {
       if (!mounted) return;
       developer.log('Event request failed (${error.failure.name}).',
@@ -1184,13 +1345,17 @@ class _DashboardScreenState extends State<DashboardScreen> {
           OutlinedButton.icon(
             key: const Key('dashboard-refresh-button'),
             onPressed: _loading ? null : _refresh,
-            icon: _loading
+            icon: _loading || _snapshotRefreshing
                 ? const SizedBox(
                     width: 15,
                     height: 15,
                     child: CircularProgressIndicator(strokeWidth: 2))
                 : const Icon(Icons.refresh, size: 18),
-            label: Text(desktop ? 'Refresh snapshot' : 'Refresh'),
+            label: Text(_snapshotRefreshing
+                ? 'Refreshing…'
+                : desktop
+                    ? 'Refresh snapshot'
+                    : 'Refresh'),
           ),
         ]),
         const SizedBox(height: 13),
@@ -1271,7 +1436,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
                       if (_lastRefreshAt != null) ...[
                         const SizedBox(height: 8),
                         Text(
-                            'Last successful refresh: ${_formatTime(_lastRefreshAt!)}',
+                            '${_snapshotRefreshing ? 'Refreshing · ' : ''}Last successful refresh: ${_formatTime(_lastRefreshAt!)}',
                             style: const TextStyle(
                                 color: Color(0xFF9B9CA5), fontSize: 12)),
                         const SizedBox(height: 12),
@@ -2266,7 +2431,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
           const SizedBox(height: 10),
           OutlinedButton.icon(
             key: const Key('retry-proposals'),
-            onPressed: _approvalLoading ? null : _loadProposals,
+            onPressed: _approvalLoading ? null : _refreshProposals,
             icon: const Icon(Icons.refresh),
             label: const Text('Retry approvals'),
           ),
@@ -2288,7 +2453,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
                 const _InlineEmpty(
                     message: 'Approval records are unavailable.'),
                 TextButton.icon(
-                    onPressed: _loadProposals,
+                    onPressed: _refreshProposals,
                     icon: const Icon(Icons.refresh),
                     label: const Text('Retry')),
               ]),
@@ -2312,7 +2477,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
               color: const Color(0xFFB5B6BE)),
           OutlinedButton.icon(
             key: const Key('refresh-proposals'),
-            onPressed: _approvalLoading ? null : _loadProposals,
+            onPressed: _approvalLoading ? null : _refreshProposals,
             icon: _approvalLoading
                 ? const SizedBox(
                     width: 14,
@@ -2323,6 +2488,15 @@ class _DashboardScreenState extends State<DashboardScreen> {
           ),
         ]),
       ),
+      if (_approvalStale)
+        Padding(
+          padding: const EdgeInsets.only(top: 8),
+          child: Text(
+            'Showing the last successful approval records${_lastProposalsRefreshAt == null ? '' : ' · Last updated ${_formatTime(_lastProposalsRefreshAt!)}'}. Retry is scheduled automatically.',
+            key: const Key('stale-proposals-banner'),
+            style: const TextStyle(color: Color(0xFFFFD99A), fontSize: 12),
+          ),
+        ),
       if (_approvalError != null) ...[
         const SizedBox(height: 8),
         _InlineErrorMessage(
