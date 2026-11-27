@@ -1,0 +1,17 @@
+.dart_tool/
+build/
+.flutter-plugins
+.flutter-plugins-dependencies
+.packages
+.env
+.env.*
+# IDE files
+.idea/
+.vscode/
+*.iml
+# Temporary files
+*.tmp
+*.temp
+*.swp
+*.swo
+*~
