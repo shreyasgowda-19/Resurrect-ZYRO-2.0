@@ -240,6 +240,8 @@ class _Capability extends StatelessWidget {
   Widget build(BuildContext context) => Row(children: [
         Icon(icon, size: 19, color: const Color(0xFF54D39A)),
         const SizedBox(width: 12),
-        Text(text, style: Theme.of(context).textTheme.bodyMedium),
+        Expanded(
+          child: Text(text, style: Theme.of(context).textTheme.bodyMedium),
+        ),
       ]);
 }
