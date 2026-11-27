@@ -9,6 +9,7 @@ import 'package:zyro_inventory_frontend/app.dart';
 import 'package:zyro_inventory_frontend/core/api/api_client.dart';
 import 'package:zyro_inventory_frontend/core/auth/auth_service.dart';
 import 'package:zyro_inventory_frontend/core/models/inventory_snapshot.dart';
+import 'package:zyro_inventory_frontend/core/models/proposal_models.dart';
 import 'package:zyro_inventory_frontend/core/models/recommendation_models.dart';
 
 import 'fixtures/local_demo_snapshot.dart';
@@ -53,6 +54,11 @@ ApiClient _apiClient(
         Future<http.Response> Function(http.Request request)? onEvent,
         Future<http.Response> Function(http.Request request)? onRecommendations,
         Future<http.Response> Function(http.Request request)? onSimulation,
+        Future<http.Response> Function()? onProposals,
+        Future<http.Response> Function(http.Request request)?
+            onProposalSubmission,
+        Future<http.Response> Function(http.Request request)?
+            onProposalDecision,
         Future<http.Response> Function()? onState,
         int Function()? stateRequestCount}) =>
     ApiClient(
@@ -94,6 +100,31 @@ ApiClient _apiClient(
           return onSimulation?.call(request) ??
               Future.value(http.Response('{}', 500));
         }
+        if (request.url.path.startsWith('/proposals/') &&
+            request.url.path.endsWith('/decision')) {
+          expect(request.headers['Authorization'], 'Bearer test-id-token');
+          return onProposalDecision?.call(request) ??
+              Future.value(http.Response('{}', 500));
+        }
+        if (request.url.path.endsWith('/proposals') &&
+            request.method == 'POST') {
+          expect(request.headers['Authorization'], 'Bearer test-id-token');
+          return onProposalSubmission?.call(request) ??
+              Future.value(http.Response('{}', 500));
+        }
+        if (request.url.path.endsWith('/proposals') &&
+            request.method == 'GET') {
+          expect(request.headers['Authorization'], 'Bearer test-id-token');
+          return onProposals?.call() ??
+              Future.value(http.Response(
+                  jsonEncode({
+                    'version': 7,
+                    'proposals': [],
+                    'purchase_orders': [],
+                    'audit_logs': [],
+                  }),
+                  200));
+        }
         return http.Response(
           healthStatus == 200
               ? '{"status":"ok","service":"inventory-api"}'
@@ -110,6 +141,24 @@ Future<void> _openRecommendationsForOrder(WidgetTester tester,
   await tester.tap(order);
   await tester.pumpAndSettle();
   expect(find.byKey(Key('recommendation-workspace-$orderId')), findsOneWidget);
+}
+
+Future<void> _openSimulatedRecommendation(WidgetTester tester,
+    {required ApiClient apiClient}) async {
+  await tester.pumpWidget(ZyroInventoryApp(
+    authService: _FakeAuthService(),
+    apiClient: apiClient,
+  ));
+  await tester.pumpAndSettle();
+  await _openRecommendationsForOrder(tester);
+  var action = find.byKey(const Key('generate-recommendations-ORD-1043'));
+  await tester.ensureVisible(action);
+  await tester.tap(action);
+  await tester.pumpAndSettle();
+  action = find.byKey(const Key('simulate-REC-EXPEDITE-7-1043'));
+  await tester.ensureVisible(action);
+  await tester.tap(action);
+  await tester.pumpAndSettle();
 }
 
 void main() {
@@ -982,6 +1031,403 @@ void main() {
       await tester.ensureVisible(action);
       await tester.tap(action);
       await tester.pumpAndSettle();
+      expect(tester.takeException(), isNull);
+    }
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+  });
+
+  test('parses proposal, purchase order, audit and decision response models',
+      () {
+    final board = ApprovalBoard.fromJson(localApprovalBoardJson);
+    expect(board.proposals.single.proposalId, 'PROP-7-1043-EXPEDITE');
+    expect(board.proposals.single.simulation.hypothetical, isTrue);
+    expect(board.purchaseOrders.single.status, 'demo_created');
+    expect(board.auditLogs.single.actorRole, 'planner');
+    final decision = ProposalDecisionResult.fromJson(localProposalDecisionJson);
+    expect(decision.status, 'applied');
+    expect(decision.version, 8);
+    expect(decision.proposal.executionStatus,
+        ProposalExecutionStatus.awaitingSupplierConfirmation);
+  });
+
+  testWidgets('planner submits only a current successfully simulated option',
+      (tester) async {
+    var submissions = 0;
+    await _openSimulatedRecommendation(
+      tester,
+      apiClient: _apiClient(
+        onRecommendations: (_) async =>
+            http.Response(jsonEncode(localRecommendationResponse), 200),
+        onSimulation: (_) async =>
+            http.Response(jsonEncode(localSimulationResponse), 200),
+        onProposalSubmission: (request) async {
+          submissions++;
+          final body = jsonDecode(request.body) as Map<String, dynamic>;
+          expect(body['order_id'], 'ORD-1043');
+          expect(body['recommendation_id'], 'REC-EXPEDITE-7-1043');
+          expect(body['expected_version'], 7);
+          return http.Response(jsonEncode(localProposalSubmissionJson), 200);
+        },
+      ),
+    );
+    final submit = find.byKey(const Key('submit-proposal-REC-EXPEDITE-7-1043'));
+    await tester.ensureVisible(submit);
+    await tester.tap(submit);
+    await tester.pumpAndSettle();
+    expect(submissions, 1);
+    expect(find.textContaining('Submitted as proposal PROP-7-1043-EXPEDITE'),
+        findsOneWidget);
+  });
+
+  testWidgets('approver can view proposals but cannot submit planner proposals',
+      (tester) async {
+    await _openSimulatedRecommendation(
+      tester,
+      apiClient: _apiClient(
+        role: 'approver',
+        onProposals: () async =>
+            http.Response(jsonEncode(localApprovalBoardJson), 200),
+        onRecommendations: (_) async =>
+            http.Response(jsonEncode(localRecommendationResponse), 200),
+        onSimulation: (_) async =>
+            http.Response(jsonEncode(localSimulationResponse), 200),
+      ),
+    );
+    expect(find.byKey(const Key('submit-proposal-REC-EXPEDITE-7-1043')),
+        findsNothing);
+    final approve =
+        find.byKey(const Key('approve-proposal-PROP-7-1043-EXPEDITE'));
+    await tester.ensureVisible(approve);
+    expect(approve, findsOneWidget);
+  });
+
+  testWidgets('proposal submission failures are visible and retryable',
+      (tester) async {
+    await _openSimulatedRecommendation(
+      tester,
+      apiClient: _apiClient(
+        onRecommendations: (_) async =>
+            http.Response(jsonEncode(localRecommendationResponse), 200),
+        onSimulation: (_) async =>
+            http.Response(jsonEncode(localSimulationResponse), 200),
+        onProposalSubmission: (_) async => http.Response(
+            '{"detail":{"code":"SERVICE_UNAVAILABLE","message":"Try later"}}',
+            503),
+      ),
+    );
+    final submit = find.byKey(const Key('submit-proposal-REC-EXPEDITE-7-1043'));
+    await tester.ensureVisible(submit);
+    await tester.tap(submit);
+    await tester.pumpAndSettle();
+    expect(find.textContaining('required backend service is unavailable'),
+        findsOneWidget);
+    expect(find.byKey(const Key('retry-proposal-REC-EXPEDITE-7-1043')),
+        findsOneWidget);
+  });
+
+  testWidgets('approver confirms approval with reason and demo assumption ack',
+      (tester) async {
+    var sentRequest = <String, dynamic>{};
+    await tester.pumpWidget(ZyroInventoryApp(
+      authService: _FakeAuthService(),
+      apiClient: _apiClient(
+        role: 'approver',
+        onProposals: () async =>
+            http.Response(jsonEncode(localApprovalBoardJson), 200),
+        onProposalDecision: (request) async {
+          sentRequest = jsonDecode(request.body) as Map<String, dynamic>;
+          expect(request.url.path, '/proposals/PROP-7-1043-EXPEDITE/decision');
+          return http.Response(jsonEncode(localProposalDecisionJson), 200);
+        },
+      ),
+    ));
+    await tester.pumpAndSettle();
+    final approve =
+        find.byKey(const Key('approve-proposal-PROP-7-1043-EXPEDITE'));
+    await tester.ensureVisible(approve);
+    await tester.tap(approve);
+    await tester.pumpAndSettle();
+    final confirm =
+        find.byKey(const Key('confirm-decision-PROP-7-1043-EXPEDITE'));
+    expect(tester.widget<FilledButton>(confirm).onPressed, isNull);
+    await tester.enterText(
+        find.byKey(const Key('decision-reason-PROP-7-1043-EXPEDITE')),
+        'Reviewed simulation and recovery evidence.');
+    await tester.pump();
+    expect(tester.widget<FilledButton>(confirm).onPressed, isNull);
+    final ack = find.byKey(const Key('acknowledge-demo-PROP-7-1043-EXPEDITE'));
+    await tester.ensureVisible(ack);
+    await tester.tap(ack);
+    await tester.pumpAndSettle();
+    await tester.ensureVisible(confirm);
+    await tester.tap(confirm);
+    await tester.pumpAndSettle();
+    expect(sentRequest['decision'], 'approve');
+    expect(sentRequest['expected_version'], 7);
+    expect(sentRequest['acknowledge_demo_assumptions'], isTrue);
+    expect(sentRequest['reason'], 'Reviewed simulation and recovery evidence.');
+    expect(sentRequest['decision_id'], matches(RegExp(r'^[0-9a-f]{32}$')));
+    expect(
+        find.textContaining('awaiting supplier confirmation'), findsOneWidget);
+  });
+
+  testWidgets('approver rejection requires a reason but not supplier ack',
+      (tester) async {
+    Map<String, dynamic>? sentRequest;
+    await tester.pumpWidget(ZyroInventoryApp(
+      authService: _FakeAuthService(),
+      apiClient: _apiClient(
+        role: 'approver',
+        onProposals: () async =>
+            http.Response(jsonEncode(localApprovalBoardJson), 200),
+        onProposalDecision: (request) async {
+          sentRequest = jsonDecode(request.body) as Map<String, dynamic>;
+          final payload = {
+            ...localProposalDecisionJson,
+            'proposal': {
+              ...localProposalDecisionJson['proposal'] as Map<String, dynamic>,
+              'status': 'rejected',
+              'execution_status': 'not_executed',
+              'purchase_order_id': null,
+            },
+          };
+          return http.Response(jsonEncode(payload), 200);
+        },
+      ),
+    ));
+    await tester.pumpAndSettle();
+    final reject =
+        find.byKey(const Key('reject-proposal-PROP-7-1043-EXPEDITE'));
+    await tester.ensureVisible(reject);
+    await tester.tap(reject);
+    await tester.pumpAndSettle();
+    await tester.enterText(
+        find.byKey(const Key('decision-reason-PROP-7-1043-EXPEDITE')),
+        'Evidence does not support this option.');
+    await tester.pump();
+    final confirm =
+        find.byKey(const Key('confirm-decision-PROP-7-1043-EXPEDITE'));
+    await tester.tap(confirm);
+    await tester.pumpAndSettle();
+    expect(sentRequest?['decision'], 'reject');
+    expect(sentRequest?['acknowledge_demo_assumptions'], isFalse);
+    expect(sentRequest?['reason'], 'Evidence does not support this option.');
+  });
+
+  testWidgets('approver cannot approve their own proposal', (tester) async {
+    final selfProposal = {
+      ...localApprovalProposal,
+      'created_by': 'test-user',
+    };
+    final board = {
+      ...localApprovalBoardJson,
+      'proposals': [selfProposal],
+    };
+    await tester.pumpWidget(ZyroInventoryApp(
+      authService: _FakeAuthService(),
+      apiClient: _apiClient(
+        role: 'approver',
+        onProposals: () async => http.Response(jsonEncode(board), 200),
+      ),
+    ));
+    await tester.pumpAndSettle();
+    await tester.ensureVisible(
+        find.byKey(const Key('proposal-card-PROP-7-1043-EXPEDITE')));
+    expect(find.byKey(const Key('approve-proposal-PROP-7-1043-EXPEDITE')),
+        findsNothing);
+    expect(find.text('You submitted this proposal and cannot approve it.'),
+        findsOneWidget);
+  });
+
+  testWidgets('stale proposal approvals are disabled', (tester) async {
+    final staleProposal = {
+      ...localApprovalProposal,
+      'snapshot_version': 6,
+      'is_stale': true,
+      'simulation': {...localSimulationResponse, 'version': 6},
+    };
+    final board = {
+      ...localApprovalBoardJson,
+      'proposals': [staleProposal],
+    };
+    await tester.pumpWidget(ZyroInventoryApp(
+      authService: _FakeAuthService(),
+      apiClient: _apiClient(
+        role: 'approver',
+        onProposals: () async => http.Response(jsonEncode(board), 200),
+      ),
+    ));
+    await tester.pumpAndSettle();
+    final approve =
+        find.byKey(const Key('approve-proposal-PROP-7-1043-EXPEDITE'));
+    await tester.ensureVisible(approve);
+    expect(tester.widget<FilledButton>(approve).onPressed, isNull);
+    expect(find.text('OUTDATED'), findsOneWidget);
+  });
+
+  testWidgets(
+      'HTTP 409 refreshes state and proposals without retrying decision',
+      (tester) async {
+    var decisionRequests = 0;
+    var stateRequests = 0;
+    var proposalRequests = 0;
+    await tester.pumpWidget(ZyroInventoryApp(
+      authService: _FakeAuthService(),
+      apiClient: _apiClient(
+        role: 'approver',
+        stateRequestCount: () => stateRequests++,
+        onState: () async =>
+            http.Response(jsonEncode(localDemoSnapshotJson), 200),
+        onProposals: () async {
+          proposalRequests++;
+          return http.Response(jsonEncode(localApprovalBoardJson), 200);
+        },
+        onProposalDecision: (_) async {
+          decisionRequests++;
+          return http.Response(
+              '{"detail":{"code":"STALE_VERSION","message":"Refresh and review."}}',
+              409);
+        },
+      ),
+    ));
+    await tester.pumpAndSettle();
+    final approve =
+        find.byKey(const Key('approve-proposal-PROP-7-1043-EXPEDITE'));
+    await tester.ensureVisible(approve);
+    await tester.tap(approve);
+    await tester.pumpAndSettle();
+    await tester.enterText(
+        find.byKey(const Key('decision-reason-PROP-7-1043-EXPEDITE')),
+        'Reviewed current proposal evidence.');
+    await tester.pump();
+    final ack = find.byKey(const Key('acknowledge-demo-PROP-7-1043-EXPEDITE'));
+    await tester.ensureVisible(ack);
+    await tester.tap(ack);
+    await tester.pumpAndSettle();
+    final confirm =
+        find.byKey(const Key('confirm-decision-PROP-7-1043-EXPEDITE'));
+    await tester.ensureVisible(confirm);
+    await tester.tap(confirm);
+    await tester.pumpAndSettle();
+    expect(decisionRequests, 1);
+    expect(stateRequests, greaterThanOrEqualTo(2));
+    expect(proposalRequests, greaterThanOrEqualTo(2));
+    expect(find.textContaining('inventory version changed'), findsOneWidget);
+  });
+
+  testWidgets('proposal submission prevents duplicate taps while pending',
+      (tester) async {
+    final response = Completer<http.Response>();
+    var submissions = 0;
+    await _openSimulatedRecommendation(
+      tester,
+      apiClient: _apiClient(
+        onRecommendations: (_) async =>
+            http.Response(jsonEncode(localRecommendationResponse), 200),
+        onSimulation: (_) async =>
+            http.Response(jsonEncode(localSimulationResponse), 200),
+        onProposalSubmission: (_) {
+          submissions++;
+          return response.future;
+        },
+      ),
+    );
+    final submit = find.byKey(const Key('submit-proposal-REC-EXPEDITE-7-1043'));
+    await tester.ensureVisible(submit);
+    await tester.tap(submit);
+    await tester.pump();
+    expect(tester.widget<FilledButton>(submit).onPressed, isNull);
+    expect(submissions, 1);
+    response
+        .complete(http.Response(jsonEncode(localProposalSubmissionJson), 200));
+    await tester.pumpAndSettle();
+    expect(submissions, 1);
+  });
+
+  testWidgets('uncertain decision retry reuses identical decision ID and body',
+      (tester) async {
+    final bodies = <String>[];
+    var attempt = 0;
+    await tester.pumpWidget(ZyroInventoryApp(
+      authService: _FakeAuthService(),
+      apiClient: _apiClient(
+        role: 'approver',
+        onProposals: () async =>
+            http.Response(jsonEncode(localApprovalBoardJson), 200),
+        onProposalDecision: (request) async {
+          bodies.add(request.body);
+          attempt++;
+          if (attempt == 1) throw http.ClientException('response lost');
+          return http.Response(jsonEncode(localProposalDecisionJson), 200);
+        },
+      ),
+    ));
+    await tester.pumpAndSettle();
+    final approve =
+        find.byKey(const Key('approve-proposal-PROP-7-1043-EXPEDITE'));
+    await tester.ensureVisible(approve);
+    await tester.tap(approve);
+    await tester.pumpAndSettle();
+    await tester.enterText(
+        find.byKey(const Key('decision-reason-PROP-7-1043-EXPEDITE')),
+        'Reviewed and approved for demonstration.');
+    await tester.pump();
+    final ack = find.byKey(const Key('acknowledge-demo-PROP-7-1043-EXPEDITE'));
+    await tester.ensureVisible(ack);
+    await tester.tap(ack);
+    await tester.pumpAndSettle();
+    final confirm =
+        find.byKey(const Key('confirm-decision-PROP-7-1043-EXPEDITE'));
+    await tester.ensureVisible(confirm);
+    await tester.tap(confirm);
+    await tester.pumpAndSettle();
+    expect(find.byKey(const Key('retry-decision-PROP-7-1043-EXPEDITE')),
+        findsOneWidget);
+    await tester
+        .tap(find.byKey(const Key('retry-decision-PROP-7-1043-EXPEDITE')));
+    await tester.pumpAndSettle();
+    expect(bodies, hasLength(2));
+    expect(bodies[1], bodies[0]);
+    final decisionId = (jsonDecode(bodies.first) as Map)['decision_id'];
+    expect(decisionId, matches(RegExp(r'^[0-9a-f]{32}$')));
+  });
+
+  testWidgets('approval dashboard displays backend PO and audit history',
+      (tester) async {
+    await tester.pumpWidget(ZyroInventoryApp(
+      authService: _FakeAuthService(),
+      apiClient: _apiClient(
+        onProposals: () async =>
+            http.Response(jsonEncode(localApprovalBoardJson), 200),
+      ),
+    ));
+    await tester.pumpAndSettle();
+    await tester.ensureVisible(find.byKey(const Key('purchase-order-DPO-001')));
+    expect(find.text('DPO-001'), findsOneWidget);
+    expect(find.text('DEMO ONLY'), findsOneWidget);
+    expect(
+        find.textContaining('not real supplier transactions'), findsOneWidget);
+    expect(find.textContaining('AUDIT-001'), findsOneWidget);
+    expect(find.textContaining('Proposal submitted · Planner'), findsOneWidget);
+  });
+
+  testWidgets('approval workspace fits mobile and desktop widths',
+      (tester) async {
+    for (final size in [const Size(390, 844), const Size(1280, 900)]) {
+      tester.view.physicalSize = size;
+      tester.view.devicePixelRatio = 1;
+      await tester.pumpWidget(ZyroInventoryApp(
+        authService: _FakeAuthService(),
+        apiClient: _apiClient(
+          onProposals: () async =>
+              http.Response(jsonEncode(localApprovalBoardJson), 200),
+        ),
+      ));
+      await tester.pumpAndSettle();
+      await tester.ensureVisible(
+          find.byKey(const Key('proposal-card-PROP-7-1043-EXPEDITE')));
+      expect(find.byKey(const Key('demo-purchase-orders')), findsOneWidget);
       expect(tester.takeException(), isNull);
     }
     addTearDown(tester.view.resetPhysicalSize);

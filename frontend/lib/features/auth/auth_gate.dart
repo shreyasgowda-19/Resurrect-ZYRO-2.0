@@ -121,6 +121,7 @@ class _ProfileLoaderState extends State<_ProfileLoader> {
             );
           }
           return DashboardScreen(
+            uid: profile.uid,
             email: profile.email,
             role: profile.role,
             getIdToken: widget.user.getIdToken,
