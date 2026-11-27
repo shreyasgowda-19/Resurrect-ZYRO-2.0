@@ -286,3 +286,34 @@ Alternate-supplier approval creates one demo PO and one synthetic incoming lot a
 | 503 | Required service unavailable |
 
 Errors use the existing `{"detail":{"code":"...","message":"..."}}` envelope.
+
+## Manufacturing AI copilot
+
+Both endpoints require a Firebase Bearer ID token for a planner or approver. They only read backend data.
+
+### `POST /ai/ask`
+
+Send a question of 1 to 1000 characters and the current inventory version. `order_id` may be null. A recognizable order ID in the question can also identify the order.
+
+```json
+{"question":"Why was ORD-1042 at risk?","order_id":"ORD-1042","expected_version":3}
+```
+
+HTTP 200 returns `version`, `role`, `mode`, `answer`, `evidence`, `suggested_questions`, and `warnings`. The mode is `gemini` when a verified Gemini selection is used, or `deterministic_fallback` when the backend selects evidence. Evidence entries contain `evidence_id`, `source_type`, `source_id`, and `summary`. Source types are `inventory`, `order`, `supplier`, `event`, `alert`, `recommendation`, `simulation`, `proposal`, `purchase_order`, and `audit`.
+
+### `GET /ai/briefing`
+
+HTTP 200 returns `version`, `role`, `mode`, `headline`, `summary`, `insights`, and `warnings`. Each insight contains `title`, `description`, `severity` (`info`, `warning`, or `critical`), `order_id` (nullable), `evidence`, and `suggested_question`.
+
+Planner briefings prioritize order risk, shortages, supplier delays, and recovery. Approver briefings prioritize pending and stale proposals, demo POs, and audit status. Current risk, historical changes, and hypothetical recovery evidence are labeled separately.
+
+| Status | Meaning |
+| --- | --- |
+| 401 | Missing or invalid authentication |
+| 403 | Unauthorized role |
+| 404 | Unknown order |
+| 409 | The expected inventory version is stale |
+| 422 | Invalid request |
+| 503 | Firebase authentication service or authoritative backend data unavailable |
+
+Errors use the existing `{"detail":{"code":"...","message":"..."}}` envelope. If a freshness recheck detects a proposal or approval change without an inventory version change, the response uses refreshed backend evidence and reports `deterministic_fallback`.
