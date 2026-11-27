@@ -9,3 +9,20 @@ The fictional Riverside Electrical Assembly plant uses a snapshot date of 2026-1
 - An open order is delayed if its CRD has passed. Otherwise, a shortage or negative slack is critical, slack of zero or one is at risk, and slack of two or more is on track.
 
 For ORD-1042, the engine reserves 600 on-hand copper units and 400 incoming units. The baseline ships on 2026-12-07, delivers on 2026-12-08, and has two days of slack. A three-day ETA slip shifts delivery to 2026-12-11 and makes the order critical.
+
+## Persisted demonstration
+
+The API uses the Firestore document `zyro_demo_inventory/current`. It stores raw demo facts, the authoritative version, and the latest 20 events and risk alerts. The `events` subcollection stores the complete accepted event history, including the original normalized request and actor UID for replay checks. The `alerts` subcollection stores escalation records independently of the bounded response history. Each event transaction updates all affected records atomically.
+
+Run the initializer from `backend\` in Windows CMD, using the demo project's Application Default Credentials.
+
+```cmd
+set "GOOGLE_APPLICATION_CREDENTIALS=%USERPROFILE%\zyro-secrets\firebase-admin.json"
+.venv\Scripts\python.exe -m scripts.init_demo_inventory
+```
+
+The initializer creates version 1 only if the authoritative document is absent. API startup and GET requests never initialize or reset the state. If the network uses a certificate authority trusted by Windows that gRPC cannot find, configure `GRPC_DEFAULT_SSL_ROOTS_FILE_PATH` and `REQUESTS_CA_BUNDLE` to a trusted PEM bundle for that terminal.
+
+The Copper demo lot is `LOT-01`. Submit a `supplier_eta_update` to move its ETA from 2026-12-05 to 2026-12-08. At version 1, this produces version 2 and escalates `ORD-1042` from `on_track` to `critical`. Alerts include the triggering change and the resulting delivery slack, shortages, or overdue CRD.
+
+For receipts, each unit increases physical on-hand and decreases the lot's outstanding quantity. The lot becomes received at zero outstanding units. Zeroing an existing material requirement retains the requirement for future changes, and an order with no positive requirements is ready on the demo date.
