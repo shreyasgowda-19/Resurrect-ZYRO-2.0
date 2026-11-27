@@ -2,7 +2,7 @@ import 'package:flutter/material.dart';
 
 import '../../core/api/api_client.dart';
 import '../../core/auth/auth_service.dart';
-import '../home/home_screen.dart';
+import '../dashboard/dashboard_screen.dart';
 import 'login_screen.dart';
 
 class AuthGate extends StatelessWidget {
@@ -120,10 +120,11 @@ class _ProfileLoaderState extends State<_ProfileLoader> {
               onSignOut: () => widget.authService.signOut(),
             );
           }
-          return HomeScreen(
-            apiClient: widget.apiClient,
-            verifiedEmail: profile.email,
+          return DashboardScreen(
+            email: profile.email,
             role: profile.role,
+            getIdToken: widget.user.getIdToken,
+            apiClient: widget.apiClient,
             onSignOut: () => _confirmSignOut(context, widget.authService),
           );
         },
