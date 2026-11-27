@@ -186,12 +186,20 @@ def evaluate_candidates(state: DemoState, order_id: str) -> tuple[EvaluatedCandi
     return tuple(feasible)
 
 
-def simulate(state: DemoState, order_id: str, recommendation_id: str) -> SimulationResponse:
+def resolve_candidate(state: DemoState, order_id: str, recommendation_id: str) -> EvaluatedCandidate:
     candidates = evaluate_candidates(state, order_id)
     candidate = next((item for item in candidates if item.recommendation.recommendation_id == recommendation_id), None)
     if candidate is None:
         raise EventError(404, "NOT_FOUND", "Recommendation not found for this order and snapshot.")
 
+    return candidate
+
+
+def simulate(state: DemoState, order_id: str, recommendation_id: str) -> SimulationResponse:
+    return simulate_candidate(state, order_id, resolve_candidate(state, order_id, recommendation_id))
+
+
+def simulate_candidate(state: DemoState, order_id: str, candidate: EvaluatedCandidate) -> SimulationResponse:
     before = candidate.before[order_id]
     after = candidate.after[order_id]
     affected = tuple(
@@ -208,7 +216,7 @@ def simulate(state: DemoState, order_id: str, recommendation_id: str) -> Simulat
     recommendation = candidate.recommendation
     return SimulationResponse(
         order_id=order_id,
-        recommendation_id=recommendation_id,
+        recommendation_id=recommendation.recommendation_id,
         version=state.version,
         before=before,
         after=after,

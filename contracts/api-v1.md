@@ -229,3 +229,60 @@ The response includes `order_id`, `recommendation_id`, `version`, `hypothetical:
 | 503 | Required service unavailable |
 
 Errors use `{"detail":{"code":"STALE_VERSION","message":"Refresh the dashboard before requesting a new calculation."}}` or the corresponding error code and message.
+
+## Human approval and demo purchase orders
+
+All three endpoints require a Firebase Bearer ID token. Use `POST /recommendations` to obtain a canonical recommendation ID for the current snapshot.
+
+### `POST /proposals`
+
+Planners submit an order, recommendation, and expected inventory version.
+
+```json
+{
+  "order_id": "ORD-1042",
+  "recommendation_id": "rec-e055092ec625a4378dd2d20f3e024106b91599eaa866d415cdd200c86f94eab4",
+  "expected_version": 2
+}
+```
+
+HTTP 200 returns `status` (`created` or `duplicate`), the current inventory `version`, and a `proposal` object. The same planner can repeat the identical request and receive the existing proposal. The proposal stores the server-generated recommendation and simulation. Submission leaves the inventory version and facts unchanged.
+
+### `GET /proposals`
+
+Planners and approvers receive `version`, `proposals`, `purchase_orders`, and `audit_logs`. All pending proposals appear first, followed by up to 20 completed proposals. Each group is ordered newest submission first, with descending proposal ID as the tie breaker. Purchase orders and audit logs are each limited to 20 and ordered newest first, with descending document ID as the tie breaker.
+
+A proposal contains `proposal_id`, `order_id`, `recommendation_id`, `action_type`, `snapshot_version`, `status`, `is_stale`, `created_by`, `created_at`, `recommendation`, `simulation`, `decided_by`, `decided_at`, `decision_reason`, `purchase_order_id`, and `execution_status`. Status is `pending`, `approved`, or `rejected`. Execution status is `not_executed`, `demo_po_created`, or `awaiting_supplier_confirmation`. Pending proposals are stale when their snapshot version differs from the current version. Decision details and PO ID are null until applicable.
+
+A purchase order contains `purchase_order_id`, `proposal_id`, `order_id`, `supplier_id`, `material_id`, `quantity`, `expected_delivery_date`, `estimated_incremental_cost`, `currency`, `status`, `created_by`, and `created_at`. Status is always `demo_created`. Expected delivery uses `YYYY-MM-DD`, unknown cost and currency are null, and timestamps use ISO 8601.
+
+An audit entry contains `audit_id`, `action`, `actor_uid`, `actor_role`, `proposal_id`, `timestamp`, `version`, and `summary`. Actions are `proposal_submitted`, `proposal_approved`, `proposal_rejected`, `purchase_order_created`, and `expedite_authorized`.
+
+### `POST /proposals/{proposal_id}/decision`
+
+Approvers supply a unique decision ID. Both approval and rejection require a reason. An approval also requires acknowledgment of the synthetic supplier assumptions and a different UID from the proposal creator.
+
+```json
+{
+  "decision_id": "copper-decision-001",
+  "decision": "approve",
+  "expected_version": 2,
+  "reason": "Reviewed the modeled recovery and supplier assumptions.",
+  "acknowledge_demo_assumptions": true
+}
+```
+
+HTTP 200 returns `status` (`applied` or `duplicate`), `version`, the decided `proposal`, and `purchase_order` (null where applicable). Retrying the identical decision with the same approver and decision ID returns the original result and version, even if newer inventory versions exist.
+
+Alternate-supplier approval creates one demo PO and one synthetic incoming lot and increments inventory version once. Rejection and expedite authorization leave the version and facts unchanged. An authorized expedite waits for confirmation. An actual or explicitly simulated confirmation can later be recorded through the existing supplier ETA event. A stale pending proposal can be rejected using the current version.
+
+| Status | Meaning |
+| --- | --- |
+| 401 | Missing or invalid authentication |
+| 403 | Unauthorized role or self-approval |
+| 404 | Unknown proposal or recommendation |
+| 409 | Stale version, evidence mismatch, existing proposal conflict, or incompatible decision |
+| 422 | Invalid request |
+| 503 | Required service unavailable |
+
+Errors use the existing `{"detail":{"code":"...","message":"..."}}` envelope.
