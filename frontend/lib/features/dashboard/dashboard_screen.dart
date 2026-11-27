@@ -6,6 +6,7 @@ import 'package:flutter/material.dart';
 
 import '../../core/api/api_client.dart';
 import '../../core/models/inventory_snapshot.dart';
+import '../../core/models/recommendation_models.dart';
 
 class DashboardScreen extends StatefulWidget {
   const DashboardScreen({
@@ -69,6 +70,14 @@ class _DashboardScreenState extends State<DashboardScreen> {
   final _adjustmentQuantity = TextEditingController();
   final _requiredQuantity = TextEditingController();
   DateTime? _newOrderDate;
+  final Map<String, RecommendationResult> _recommendationsByOrder = {};
+  final Map<String, String> _recommendationErrors = {};
+  final Set<String> _recommendationLoads = {};
+  final Map<String, int> _recommendationSequences = {};
+  final Map<String, SimulationResult> _simulations = {};
+  final Map<String, String> _simulationErrors = {};
+  final Set<String> _simulationLoads = {};
+  final Map<String, int> _simulationSequences = {};
 
   @override
   void initState() {
@@ -332,6 +341,143 @@ class _DashboardScreenState extends State<DashboardScreen> {
       if (mounted) setState(() => _submittingEvent = false);
     }
   }
+
+  String _simulationKey(String orderId, String recommendationId) =>
+      '$orderId::$recommendationId';
+
+  Future<void> _generateRecommendations(CustomerOrder order) async {
+    final snapshot = _snapshot;
+    if (snapshot == null || _recommendationLoads.contains(order.orderId)) {
+      return;
+    }
+    final version = snapshot.version;
+    final sequence = (_recommendationSequences[order.orderId] ?? 0) + 1;
+    _recommendationSequences[order.orderId] = sequence;
+    setState(() {
+      _recommendationLoads.add(order.orderId);
+      _recommendationErrors.remove(order.orderId);
+    });
+    try {
+      final token = await widget.getIdToken();
+      final result = await _apiClient.postRecommendations(
+        idToken: token,
+        orderId: order.orderId,
+        expectedVersion: version,
+      );
+      if (!mounted || _recommendationSequences[order.orderId] != sequence) {
+        return;
+      }
+      setState(() {
+        if (_snapshot?.version == version &&
+            result.version == version &&
+            result.orderId == order.orderId) {
+          _recommendationsByOrder[order.orderId] = result;
+        } else {
+          _recommendationErrors[order.orderId] =
+              'The snapshot changed while recommendations were loading. Generate them again for the current version.';
+        }
+      });
+    } on ComputationApiException catch (error) {
+      if (!mounted || _recommendationSequences[order.orderId] != sequence) {
+        return;
+      }
+      setState(() => _recommendationErrors[order.orderId] =
+          _computationErrorMessage(error));
+      if (error.failure == ComputationApiFailure.staleVersion) {
+        await _loadSnapshot();
+      }
+    } catch (_) {
+      if (!mounted || _recommendationSequences[order.orderId] != sequence) {
+        return;
+      }
+      setState(() => _recommendationErrors[order.orderId] =
+          'Recommendations could not be loaded. Check the connection and retry.');
+    } finally {
+      if (mounted && _recommendationSequences[order.orderId] == sequence) {
+        setState(() => _recommendationLoads.remove(order.orderId));
+      }
+    }
+  }
+
+  Future<void> _simulateRecommendation(
+      CustomerOrder order, InventoryRecommendation recommendation) async {
+    final snapshot = _snapshot;
+    final currentRecommendations = _recommendationsByOrder[order.orderId];
+    if (snapshot == null ||
+        currentRecommendations == null ||
+        currentRecommendations.version != snapshot.version ||
+        _simulationLoads.contains(
+            _simulationKey(order.orderId, recommendation.recommendationId))) {
+      return;
+    }
+    final key = _simulationKey(order.orderId, recommendation.recommendationId);
+    final version = snapshot.version;
+    final sequence = (_simulationSequences[key] ?? 0) + 1;
+    _simulationSequences[key] = sequence;
+    setState(() {
+      _simulationLoads.add(key);
+      _simulationErrors.remove(key);
+    });
+    try {
+      final token = await widget.getIdToken();
+      final result = await _apiClient.postSimulation(
+        idToken: token,
+        orderId: order.orderId,
+        recommendationId: recommendation.recommendationId,
+        expectedVersion: version,
+      );
+      if (!mounted || _simulationSequences[key] != sequence) return;
+      setState(() {
+        if (_snapshot?.version == version &&
+            result.version == version &&
+            result.orderId == order.orderId &&
+            result.recommendationId == recommendation.recommendationId) {
+          _simulations[key] = result;
+        } else {
+          _simulationErrors[key] =
+              'The snapshot changed while this simulation was running. Regenerate recommendations before simulating again.';
+        }
+      });
+    } on ComputationApiException catch (error) {
+      if (!mounted || _simulationSequences[key] != sequence) return;
+      setState(() => _simulationErrors[key] = _computationErrorMessage(error));
+      if (error.failure == ComputationApiFailure.staleVersion) {
+        await _loadSnapshot();
+      }
+    } catch (_) {
+      if (!mounted || _simulationSequences[key] != sequence) return;
+      setState(() => _simulationErrors[key] =
+          'Simulation could not be completed. Check the connection and retry.');
+    } finally {
+      if (mounted && _simulationSequences[key] == sequence) {
+        setState(() => _simulationLoads.remove(key));
+      }
+    }
+  }
+
+  String _computationErrorMessage(ComputationApiException error) =>
+      switch (error.failure) {
+        ComputationApiFailure.unauthorized =>
+          'Your sign-in session was rejected. Sign in again.',
+        ComputationApiFailure.forbidden =>
+          'Your verified role is not authorized to run this read-only computation.',
+        ComputationApiFailure.notFound =>
+          error.message ?? 'The order or recommendation was not found.',
+        ComputationApiFailure.staleVersion =>
+          'The inventory snapshot changed. Current state is refreshing; regenerate before running another simulation.',
+        ComputationApiFailure.validation => error.message ??
+            'The request was invalid. Review the selected order.',
+        ComputationApiFailure.unavailable =>
+          'A required backend service is unavailable. Retry when it is available.',
+        ComputationApiFailure.timeout =>
+          'The computation timed out. You can retry it.',
+        ComputationApiFailure.connectivity =>
+          'Could not connect to the recommendation service. Check the network and retry.',
+        ComputationApiFailure.malformedResponse =>
+          'The backend returned data that does not match the T3 contract.',
+        ComputationApiFailure.backendError =>
+          error.message ?? 'The backend could not complete the computation.',
+      };
 
   String _errorMessage(StateApiException error) => switch (error.failure) {
         StateApiFailure.unauthorized =>
@@ -1419,6 +1565,9 @@ class _DashboardScreenState extends State<DashboardScreen> {
                 'Projected ship', _displayDate(selected.projectedShipDate)),
             _DetailValue('Projected delivery',
                 _displayDate(selected.projectedDeliveryDate)),
+            _DetailValue('Customer request date',
+                _displayDate(selected.crd, fallback: 'Not provided')),
+            _DetailValue('Current risk', selected.risk.label),
             _DetailValue(
                 'Slack days',
                 selected.slackDays == null
@@ -1454,9 +1603,414 @@ class _DashboardScreenState extends State<DashboardScreen> {
                 ],
               ),
             ),
+          const SizedBox(height: 18),
+          _supplierFactsForOrder(snapshot, selected),
+          const SizedBox(height: 18),
+          _recommendationWorkspace(snapshot, selected),
         ]),
       ),
     );
+  }
+
+  Widget _supplierFactsForOrder(
+      InventorySnapshot snapshot, CustomerOrder order) {
+    final requirements = snapshot.orderRequirements
+        .where((requirement) => requirement.orderId == order.orderId)
+        .map((requirement) => requirement.materialId)
+        .toSet();
+    final materialIds = requirements.isEmpty
+        ? order.shortages.map((shortage) => shortage.materialId).toSet()
+        : requirements;
+    final lots = snapshot.supplyLots
+        .where((lot) => materialIds.contains(lot.materialId))
+        .toList();
+    return _SectionCard(
+      child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+        const Text('Relevant supplier and material facts',
+            style: TextStyle(fontSize: 15, fontWeight: FontWeight.w700)),
+        const SizedBox(height: 8),
+        if (lots.isEmpty)
+          const Text(
+              'No related supplier lots were included in the current backend snapshot.')
+        else
+          for (final lot in lots)
+            ListTile(
+              contentPadding: EdgeInsets.zero,
+              leading: const Icon(Icons.local_shipping_outlined,
+                  color: Color(0xFF9B78FF)),
+              title:
+                  Text('${lot.lotId} · ${lot.materialId} · ${lot.supplierId}'),
+              subtitle: Text(
+                  'ETA ${_displayDate(lot.eta)} · Outstanding ${lot.remainingQuantity} · ${_titleCase(lot.status)}'),
+            ),
+      ]),
+    );
+  }
+
+  Widget _recommendationWorkspace(
+      InventorySnapshot snapshot, CustomerOrder order) {
+    final eligible = order.risk != OrderRisk.onTrack;
+    final result = _recommendationsByOrder[order.orderId];
+    final outdated = result != null && result.version != snapshot.version;
+    final loading = _recommendationLoads.contains(order.orderId);
+    final error = _recommendationErrors[order.orderId];
+    return _SectionCard(
+      key: Key('recommendation-workspace-${order.orderId}'),
+      child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+        Row(children: [
+          const Icon(Icons.auto_awesome, color: Color(0xFF9B78FF)),
+          const SizedBox(width: 9),
+          const Expanded(
+              child: Text('Recommendations',
+                  style: TextStyle(fontSize: 18, fontWeight: FontWeight.w700))),
+          if (result != null)
+            _MetadataChip(
+              icon: Icons.tag,
+              label:
+                  '${result.dataMode.toUpperCase()} · Version ${result.version}',
+              color:
+                  outdated ? const Color(0xFFFFC266) : const Color(0xFFB5B6BE),
+            ),
+        ]),
+        const SizedBox(height: 8),
+        Text(
+          'Backend-calculated options for ${order.orderId}. Recommendations are not guaranteed recovery; all simulations are hypothetical and read-only.',
+          style: const TextStyle(color: Color(0xFFB5B6BE), height: 1.4),
+        ),
+        const SizedBox(height: 12),
+        Wrap(spacing: 18, runSpacing: 8, children: [
+          _DetailValue('Customer request date',
+              _displayDate(order.crd, fallback: 'Not provided')),
+          _DetailValue(
+              'Projected delivery', _displayDate(order.projectedDeliveryDate)),
+          _DetailValue('Current risk', order.risk.label),
+          _DetailValue(
+              'Delivery slack',
+              order.slackDays == null
+                  ? 'Unavailable'
+                  : '${order.slackDays} days'),
+        ]),
+        const SizedBox(height: 14),
+        if (!eligible)
+          const _InlineEmpty(
+              message:
+                  'Recommendations are available for at-risk, critical and delayed orders.')
+        else ...[
+          Wrap(
+              spacing: 10,
+              runSpacing: 8,
+              crossAxisAlignment: WrapCrossAlignment.center,
+              children: [
+                FilledButton.icon(
+                  key: Key('generate-recommendations-${order.orderId}'),
+                  onPressed:
+                      loading ? null : () => _generateRecommendations(order),
+                  icon: loading
+                      ? const SizedBox(
+                          width: 16,
+                          height: 16,
+                          child: CircularProgressIndicator(strokeWidth: 2))
+                      : const Icon(Icons.auto_awesome, size: 18),
+                  label: Text(loading
+                      ? 'Generating…'
+                      : outdated
+                          ? 'Regenerate for v${snapshot.version}'
+                          : result == null
+                              ? 'Generate recommendations'
+                              : 'Regenerate recommendations'),
+                ),
+                if (outdated)
+                  const Text(
+                    'Previous options are outdated. Generate them again before simulating.',
+                    key: Key('recommendations-outdated'),
+                    style: TextStyle(color: Color(0xFFFFC266)),
+                  ),
+              ]),
+          if (error != null) ...[
+            const SizedBox(height: 10),
+            _InlineErrorMessage(error),
+            if (!loading)
+              Align(
+                alignment: Alignment.centerLeft,
+                child: TextButton.icon(
+                  key: Key('retry-recommendations-${order.orderId}'),
+                  onPressed: () => _generateRecommendations(order),
+                  icon: const Icon(Icons.refresh),
+                  label: const Text('Retry'),
+                ),
+              ),
+          ],
+          if (result != null) ...[
+            const SizedBox(height: 14),
+            if (result.recommendations.isEmpty)
+              const _InlineEmpty(
+                  message:
+                      'The backend returned no recommendations for this order at the current snapshot version.')
+            else
+              LayoutBuilder(builder: (context, constraints) {
+                final cardWidth = constraints.maxWidth >= 900
+                    ? (constraints.maxWidth - 14) / 2
+                    : constraints.maxWidth;
+                return Wrap(
+                  spacing: 14,
+                  runSpacing: 14,
+                  children: [
+                    for (final recommendation in result.recommendations)
+                      SizedBox(
+                        width: cardWidth,
+                        child: _recommendationCard(
+                            order, result, recommendation,
+                            outdated: outdated),
+                      ),
+                  ],
+                );
+              }),
+          ],
+        ],
+      ]),
+    );
+  }
+
+  Widget _recommendationCard(
+    CustomerOrder order,
+    RecommendationResult result,
+    InventoryRecommendation recommendation, {
+    required bool outdated,
+  }) {
+    final key = _simulationKey(order.orderId, recommendation.recommendationId);
+    final simulation = _simulations[key];
+    final simulationOutdated = simulation != null &&
+        (_snapshot?.version != simulation.version || outdated);
+    final loading = _simulationLoads.contains(key);
+    final error = _simulationErrors[key];
+    return _SectionCard(
+      key: Key('recommendation-card-${recommendation.recommendationId}'),
+      child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+        Text(recommendation.title,
+            key: Key('recommendation-title-${recommendation.recommendationId}'),
+            style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w700)),
+        const SizedBox(height: 6),
+        Text(
+            switch (recommendation.actionType) {
+              RecommendationAction.expediteExistingLot =>
+                'Expedite existing lot',
+              RecommendationAction.alternateSupplierPo =>
+                'Alternate supplier PO',
+            },
+            style: const TextStyle(color: Color(0xFF9B78FF), fontSize: 12)),
+        const SizedBox(height: 8),
+        Text(recommendation.explanation),
+        const SizedBox(height: 12),
+        Wrap(spacing: 14, runSpacing: 8, children: [
+          _DetailValue('Material', recommendation.materialId),
+          _DetailValue('Supplier', recommendation.supplierId),
+          _DetailValue('Lot', recommendation.lotId ?? 'Not applicable'),
+          _DetailValue('Quantity', '${recommendation.quantity}'),
+          _DetailValue('Proposed ETA', _formatDate(recommendation.proposedEta)),
+          _DetailValue(
+              'Estimated incremental cost',
+              _costText(recommendation.estimatedIncrementalCost,
+                  recommendation.currency)),
+        ]),
+        if (recommendation.evidence.isNotEmpty) ...[
+          const SizedBox(height: 12),
+          const Text('Evidence', style: TextStyle(fontWeight: FontWeight.w600)),
+          for (final evidence in recommendation.evidence)
+            _BulletText(text: evidence),
+        ],
+        if (recommendation.assumptions.isNotEmpty) ...[
+          const SizedBox(height: 10),
+          const Text('Assumptions',
+              style: TextStyle(fontWeight: FontWeight.w600)),
+          for (final assumption in recommendation.assumptions)
+            _BulletText(text: assumption),
+        ],
+        const SizedBox(height: 12),
+        Align(
+          alignment: Alignment.centerLeft,
+          child: FilledButton.tonalIcon(
+            key: Key('simulate-${recommendation.recommendationId}'),
+            onPressed: outdated || simulationOutdated || loading
+                ? null
+                : () => _simulateRecommendation(order, recommendation),
+            icon: loading
+                ? const SizedBox(
+                    width: 15,
+                    height: 15,
+                    child: CircularProgressIndicator(strokeWidth: 2))
+                : const Icon(Icons.science_outlined, size: 18),
+            label: Text(loading ? 'Simulating…' : 'Simulate what-if'),
+          ),
+        ),
+        if (error != null) ...[
+          const SizedBox(height: 8),
+          _InlineErrorMessage(error),
+          if (!outdated && !loading)
+            Align(
+              alignment: Alignment.centerLeft,
+              child: TextButton(
+                onPressed: () => _simulateRecommendation(order, recommendation),
+                child: const Text('Retry simulation'),
+              ),
+            ),
+        ],
+        if (simulation != null) ...[
+          const SizedBox(height: 12),
+          if (simulationOutdated)
+            Text(
+              'Outdated simulation · v${simulation.version} · current v${_snapshot?.version}',
+              key:
+                  Key('simulation-outdated-${recommendation.recommendationId}'),
+              style: const TextStyle(color: Color(0xFFFFC266)),
+            ),
+          _simulationCard(simulation, recommendation.recommendationId),
+        ],
+      ]),
+    );
+  }
+
+  Widget _simulationCard(
+          SimulationResult simulation, String recommendationId) =>
+      Container(
+        key: Key('simulation-result-$recommendationId'),
+        padding: const EdgeInsets.all(12),
+        decoration: BoxDecoration(
+          color: const Color(0xFF1A2025),
+          borderRadius: BorderRadius.circular(12),
+          border: Border.all(color: const Color(0xFF54D39A).withAlpha(90)),
+        ),
+        child:
+            Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+          const Wrap(spacing: 8, runSpacing: 6, children: [
+            Chip(label: Text('HYPOTHETICAL')),
+            Text('Read-only what-if result',
+                style: TextStyle(color: Color(0xFF9B9CA5))),
+          ]),
+          const SizedBox(height: 8),
+          Text('Order ${simulation.orderId}',
+              style: const TextStyle(fontWeight: FontWeight.w700)),
+          const SizedBox(height: 8),
+          _outcomeComparison(
+              'Target order', simulation.before, simulation.after),
+          if (simulation.affectedOrders.isNotEmpty) ...[
+            const SizedBox(height: 12),
+            Text('Other affected orders (${simulation.affectedOrders.length})',
+                style: const TextStyle(fontWeight: FontWeight.w700)),
+            for (final affected in simulation.affectedOrders) ...[
+              const Divider(height: 16),
+              Text(affected.orderId,
+                  style: const TextStyle(fontWeight: FontWeight.w600)),
+              _outcomeComparison(
+                  'Collateral impact', affected.before, affected.after),
+            ],
+          ],
+          const SizedBox(height: 8),
+          _DetailValue(
+              'Estimated incremental cost',
+              _costText(
+                  simulation.estimatedIncrementalCost, simulation.currency)),
+          if (simulation.warnings.isNotEmpty) ...[
+            const SizedBox(height: 8),
+            const Text('Warnings',
+                style: TextStyle(
+                    color: Color(0xFFFFC266), fontWeight: FontWeight.w700)),
+            for (final warning in simulation.warnings)
+              _BulletText(text: warning),
+          ],
+          if (simulation.assumptions.isNotEmpty) ...[
+            const SizedBox(height: 8),
+            const Text('Assumptions',
+                style: TextStyle(fontWeight: FontWeight.w700)),
+            for (final assumption in simulation.assumptions)
+              _BulletText(text: assumption),
+          ],
+        ]),
+      );
+
+  Widget _outcomeComparison(
+          String heading, OrderOutcome before, OrderOutcome after) =>
+      Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+        Text(heading,
+            style: const TextStyle(color: Color(0xFFB5B6BE), fontSize: 12)),
+        const SizedBox(height: 7),
+        LayoutBuilder(builder: (context, constraints) {
+          final cellWidth =
+              constraints.maxWidth >= 560 ? 180.0 : constraints.maxWidth;
+          return Wrap(spacing: 10, runSpacing: 10, children: [
+            _outcomeValue(
+                'Projected ship',
+                _displayDate(before.projectedShipDate),
+                _displayDate(after.projectedShipDate),
+                _dateChangeColor(
+                    before.projectedShipDate, after.projectedShipDate),
+                cellWidth),
+            _outcomeValue(
+                'Projected delivery',
+                _displayDate(before.projectedDeliveryDate),
+                _displayDate(after.projectedDeliveryDate),
+                _dateChangeColor(
+                    before.projectedDeliveryDate, after.projectedDeliveryDate),
+                cellWidth),
+            _outcomeValue(
+                'Slack days',
+                before.slackDays?.toString() ?? 'Unavailable',
+                after.slackDays?.toString() ?? 'Unavailable',
+                _slackChangeColor(before.slackDays, after.slackDays),
+                cellWidth),
+            SizedBox(
+              width: cellWidth,
+              child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    const Text('Risk',
+                        style:
+                            TextStyle(color: Color(0xFF9B9CA5), fontSize: 11)),
+                    const SizedBox(height: 4),
+                    Wrap(spacing: 6, runSpacing: 5, children: [
+                      _RiskPill(risk: before.risk),
+                      const Icon(Icons.arrow_forward,
+                          size: 16, color: Color(0xFF9B9CA5)),
+                      _RiskPill(risk: after.risk),
+                    ]),
+                  ]),
+            ),
+          ]);
+        }),
+      ]);
+
+  Widget _outcomeValue(String label, String before, String after,
+          Color? afterColor, double width) =>
+      SizedBox(
+        width: width,
+        child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          Text(label,
+              style: const TextStyle(color: Color(0xFF9B9CA5), fontSize: 11)),
+          const SizedBox(height: 4),
+          Text('Before  $before', style: const TextStyle(fontSize: 12)),
+          Text('After   $after',
+              style: TextStyle(
+                  fontSize: 12,
+                  fontWeight: FontWeight.w700,
+                  color: afterColor)),
+        ]),
+      );
+
+  Color? _dateChangeColor(DateTime? before, DateTime? after) {
+    if (before == null || after == null || before == after) return null;
+    return after.isBefore(before)
+        ? const Color(0xFF54D39A)
+        : const Color(0xFFFF7777);
+  }
+
+  Color? _slackChangeColor(int? before, int? after) {
+    if (before == null || after == null || before == after) return null;
+    return after > before ? const Color(0xFF54D39A) : const Color(0xFFFF7777);
+  }
+
+  String _costText(num? cost, String? currency) {
+    if (cost == null) return 'Not available';
+    final amount = cost is int ? '$cost' : cost.toStringAsFixed(2);
+    return currency == null ? amount : '$currency $amount';
   }
 }
 
@@ -1514,7 +2068,9 @@ class _OverviewCard extends StatelessWidget {
 
 class _SectionCard extends StatelessWidget {
   const _SectionCard(
-      {required this.child, this.padding = const EdgeInsets.all(16)});
+      {super.key,
+      required this.child,
+      this.padding = const EdgeInsets.all(16)});
 
   final Widget child;
   final EdgeInsetsGeometry padding;
@@ -1724,6 +2280,38 @@ class _InlineEmpty extends StatelessWidget {
           child:
               Text(message, style: const TextStyle(color: Color(0xFF9B9CA5))),
         ),
+      );
+}
+
+class _InlineErrorMessage extends StatelessWidget {
+  const _InlineErrorMessage(this.message);
+
+  final String message;
+
+  @override
+  Widget build(BuildContext context) => Container(
+        padding: const EdgeInsets.all(12),
+        decoration: BoxDecoration(
+          color: const Color(0xFF3A252B),
+          borderRadius: BorderRadius.circular(10),
+          border: Border.all(color: const Color(0xFFFF7777).withAlpha(90)),
+        ),
+        child: Text(message, style: const TextStyle(color: Color(0xFFFFA0A0))),
+      );
+}
+
+class _BulletText extends StatelessWidget {
+  const _BulletText({required this.text});
+
+  final String text;
+
+  @override
+  Widget build(BuildContext context) => Padding(
+        padding: const EdgeInsets.only(top: 5),
+        child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          const Text('•  ', style: TextStyle(color: Color(0xFF9B78FF))),
+          Expanded(child: Text(text, style: const TextStyle(height: 1.35))),
+        ]),
       );
 }
 

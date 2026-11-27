@@ -9,6 +9,7 @@ import 'package:zyro_inventory_frontend/app.dart';
 import 'package:zyro_inventory_frontend/core/api/api_client.dart';
 import 'package:zyro_inventory_frontend/core/auth/auth_service.dart';
 import 'package:zyro_inventory_frontend/core/models/inventory_snapshot.dart';
+import 'package:zyro_inventory_frontend/core/models/recommendation_models.dart';
 
 import 'fixtures/local_demo_snapshot.dart';
 
@@ -50,6 +51,8 @@ ApiClient _apiClient(
         int stateStatus = 200,
         String role = 'planner',
         Future<http.Response> Function(http.Request request)? onEvent,
+        Future<http.Response> Function(http.Request request)? onRecommendations,
+        Future<http.Response> Function(http.Request request)? onSimulation,
         Future<http.Response> Function()? onState,
         int Function()? stateRequestCount}) =>
     ApiClient(
@@ -81,6 +84,16 @@ ApiClient _apiClient(
           return onEvent?.call(request) ??
               Future.value(http.Response('{}', 500));
         }
+        if (request.url.path.endsWith('/recommendations')) {
+          expect(request.headers['Authorization'], 'Bearer test-id-token');
+          return onRecommendations?.call(request) ??
+              Future.value(http.Response('{}', 500));
+        }
+        if (request.url.path.endsWith('/simulate')) {
+          expect(request.headers['Authorization'], 'Bearer test-id-token');
+          return onSimulation?.call(request) ??
+              Future.value(http.Response('{}', 500));
+        }
         return http.Response(
           healthStatus == 200
               ? '{"status":"ok","service":"inventory-api"}'
@@ -89,6 +102,15 @@ ApiClient _apiClient(
         );
       }),
     );
+
+Future<void> _openRecommendationsForOrder(WidgetTester tester,
+    {String orderId = 'ORD-1043'}) async {
+  final order = find.text(orderId).first;
+  await tester.ensureVisible(order);
+  await tester.tap(order);
+  await tester.pumpAndSettle();
+  expect(find.byKey(Key('recommendation-workspace-$orderId')), findsOneWidget);
+}
 
 void main() {
   final viewports = <(String, Size)>[
@@ -173,6 +195,22 @@ void main() {
     expect(atRisk.projectedShipDate, isNull);
     expect(atRisk.projectedDeliveryDate, isNull);
     expect(atRisk.slackDays, isNull);
+  });
+
+  test('parses typed recommendation and hypothetical simulation responses', () {
+    final recommendations =
+        RecommendationResult.fromJson(localRecommendationResponse);
+    final simulation = SimulationResult.fromJson(localSimulationResponse);
+
+    expect(recommendations.version, 7);
+    expect(recommendations.recommendations, hasLength(2));
+    expect(
+        recommendations.recommendations.first.estimatedIncrementalCost, isNull);
+    expect(recommendations.recommendations.first.lotId, 'LOT-7002');
+    expect(simulation.hypothetical, isTrue);
+    expect(simulation.before.projectedDeliveryDate, isNull);
+    expect(simulation.after.risk, OrderRisk.onTrack);
+    expect(simulation.affectedOrders.single.orderId, 'ORD-1044');
   });
 
   test('rejects malformed or unknown risk data', () {
@@ -597,6 +635,353 @@ void main() {
       await tester.ensureVisible(find.byKey(const Key('eta-lot-select')));
       expect(find.byKey(const Key('eta-lot-select')), findsOneWidget);
       expect(find.byKey(const Key('submit-adjustment-event')), findsOneWidget);
+      expect(tester.takeException(), isNull);
+    }
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+  });
+
+  testWidgets(
+      'generates recommendations using the current version and renders evidence',
+      (tester) async {
+    http.Request? recommendationRequest;
+    await tester.pumpWidget(ZyroInventoryApp(
+      authService: _FakeAuthService(),
+      apiClient: _apiClient(onRecommendations: (request) async {
+        recommendationRequest = request;
+        return http.Response(jsonEncode(localRecommendationResponse), 200);
+      }),
+    ));
+    await tester.pumpAndSettle();
+    await _openRecommendationsForOrder(tester);
+    final generate = find.byKey(const Key('generate-recommendations-ORD-1043'));
+    await tester.ensureVisible(generate);
+    await tester.tap(generate);
+    await tester.pumpAndSettle();
+
+    expect(recommendationRequest?.method, 'POST');
+    expect(recommendationRequest?.url.path, '/recommendations');
+    expect(recommendationRequest?.headers['Authorization'],
+        'Bearer test-id-token');
+    final body =
+        jsonDecode(recommendationRequest!.body) as Map<String, dynamic>;
+    expect(body, {'order_id': 'ORD-1043', 'expected_version': 7});
+    expect(find.text('Expedite existing steel lot'), findsOneWidget);
+    expect(find.text('Not available'), findsOneWidget);
+    expect(find.text('Current ETA is 11 Dec 2026.'), findsOneWidget);
+    expect(find.text('Supplier can meet the proposed ETA.'), findsOneWidget);
+  });
+
+  testWidgets('recommendation generation exposes a loading state',
+      (tester) async {
+    final response = Completer<http.Response>();
+    await tester.pumpWidget(ZyroInventoryApp(
+      authService: _FakeAuthService(),
+      apiClient: _apiClient(onRecommendations: (_) => response.future),
+    ));
+    await tester.pumpAndSettle();
+    await _openRecommendationsForOrder(tester);
+    final generate = find.byKey(const Key('generate-recommendations-ORD-1043'));
+    await tester.ensureVisible(generate);
+    await tester.tap(generate);
+    await tester.pump();
+    expect(find.text('Generating…'), findsOneWidget);
+    expect(tester.widget<FilledButton>(generate).onPressed, isNull);
+    response
+        .complete(http.Response(jsonEncode(localRecommendationResponse), 200));
+    await tester.pumpAndSettle();
+    expect(find.text('Expedite existing steel lot'), findsOneWidget);
+  });
+
+  testWidgets(
+      'simulation shows hypothetical before-after and collateral outcomes',
+      (tester) async {
+    http.Request? simulationRequest;
+    await tester.pumpWidget(ZyroInventoryApp(
+      authService: _FakeAuthService(),
+      apiClient: _apiClient(
+        onRecommendations: (_) async =>
+            http.Response(jsonEncode(localRecommendationResponse), 200),
+        onSimulation: (request) async {
+          simulationRequest = request;
+          return http.Response(jsonEncode(localSimulationResponse), 200);
+        },
+      ),
+    ));
+    await tester.pumpAndSettle();
+    await _openRecommendationsForOrder(tester);
+    final generate = find.byKey(const Key('generate-recommendations-ORD-1043'));
+    await tester.ensureVisible(generate);
+    await tester.tap(generate);
+    await tester.pumpAndSettle();
+    final simulate = find.byKey(const Key('simulate-REC-EXPEDITE-7-1043'));
+    await tester.ensureVisible(simulate);
+    await tester.tap(simulate);
+    await tester.pumpAndSettle();
+
+    expect(simulationRequest?.method, 'POST');
+    expect(simulationRequest?.url.path, '/simulate');
+    final body = jsonDecode(simulationRequest!.body) as Map<String, dynamic>;
+    expect(body, {
+      'order_id': 'ORD-1043',
+      'recommendation_id': 'REC-EXPEDITE-7-1043',
+      'expected_version': 7,
+    });
+    expect(find.text('HYPOTHETICAL'), findsOneWidget);
+    expect(find.textContaining('Before'), findsWidgets);
+    expect(find.text('Other affected orders (1)'), findsOneWidget);
+    expect(find.text('ORD-1044'), findsWidgets);
+    expect(find.textContaining('Other orders may be affected'), findsOneWidget);
+    expect(find.text('Estimated incremental cost'), findsWidgets);
+  });
+
+  testWidgets('simulation backend failures show a retry action',
+      (tester) async {
+    await tester.pumpWidget(ZyroInventoryApp(
+      authService: _FakeAuthService(),
+      apiClient: _apiClient(
+        onRecommendations: (_) async =>
+            http.Response(jsonEncode(localRecommendationResponse), 200),
+        onSimulation: (_) async => http.Response(
+            '{"detail":{"code":"SERVICE_UNAVAILABLE","message":"Try later"}}',
+            503),
+      ),
+    ));
+    await tester.pumpAndSettle();
+    await _openRecommendationsForOrder(tester);
+    final generate = find.byKey(const Key('generate-recommendations-ORD-1043'));
+    await tester.ensureVisible(generate);
+    await tester.tap(generate);
+    await tester.pumpAndSettle();
+    final simulate = find.byKey(const Key('simulate-REC-EXPEDITE-7-1043'));
+    await tester.ensureVisible(simulate);
+    await tester.tap(simulate);
+    await tester.pumpAndSettle();
+    expect(find.textContaining('required backend service is unavailable'),
+        findsOneWidget);
+    expect(find.text('Retry simulation'), findsOneWidget);
+  });
+
+  testWidgets(
+      'simulates multiple options for side-by-side comparison on wide screens',
+      (tester) async {
+    tester.view.physicalSize = const Size(1280, 900);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+    await tester.pumpWidget(ZyroInventoryApp(
+      authService: _FakeAuthService(),
+      apiClient: _apiClient(
+        onRecommendations: (_) async =>
+            http.Response(jsonEncode(localRecommendationResponse), 200),
+        onSimulation: (request) async {
+          final body = jsonDecode(request.body) as Map<String, dynamic>;
+          return http.Response(
+              jsonEncode({
+                ...localSimulationResponse,
+                'recommendation_id': body['recommendation_id']
+              }),
+              200);
+        },
+      ),
+    ));
+    await tester.pumpAndSettle();
+    await _openRecommendationsForOrder(tester);
+    final generate = find.byKey(const Key('generate-recommendations-ORD-1043'));
+    await tester.ensureVisible(generate);
+    await tester.tap(generate);
+    await tester.pumpAndSettle();
+    for (final id in ['REC-EXPEDITE-7-1043', 'REC-ALT-7-1043']) {
+      final simulate = find.byKey(Key('simulate-$id'));
+      await tester.ensureVisible(simulate);
+      await tester.tap(simulate);
+      await tester.pumpAndSettle();
+    }
+    final firstCard = tester.getTopLeft(
+        find.byKey(const Key('recommendation-card-REC-EXPEDITE-7-1043')));
+    final secondCard = tester.getTopLeft(
+        find.byKey(const Key('recommendation-card-REC-ALT-7-1043')));
+    expect(secondCard.dx, greaterThan(firstCard.dx + 100));
+    expect(find.byKey(const Key('simulation-result-REC-EXPEDITE-7-1043')),
+        findsOneWidget);
+    expect(find.byKey(const Key('simulation-result-REC-ALT-7-1043')),
+        findsOneWidget);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('empty recommendation response is clearly displayed',
+      (tester) async {
+    await tester.pumpWidget(ZyroInventoryApp(
+      authService: _FakeAuthService(),
+      apiClient: _apiClient(
+          onRecommendations: (_) async => http.Response(
+              jsonEncode(
+                  {...localRecommendationResponse, 'recommendations': []}),
+              200)),
+    ));
+    await tester.pumpAndSettle();
+    await _openRecommendationsForOrder(tester);
+    final generate = find.byKey(const Key('generate-recommendations-ORD-1043'));
+    await tester.ensureVisible(generate);
+    await tester.tap(generate);
+    await tester.pumpAndSettle();
+    expect(find.textContaining('backend returned no recommendations'),
+        findsOneWidget);
+  });
+
+  testWidgets('recommendation errors show retry controls', (tester) async {
+    await tester.pumpWidget(ZyroInventoryApp(
+      authService: _FakeAuthService(),
+      apiClient: _apiClient(
+          onRecommendations: (_) async => http.Response(
+              '{"detail":{"code":"SERVICE_UNAVAILABLE","message":"Try later"}}',
+              503)),
+    ));
+    await tester.pumpAndSettle();
+    await _openRecommendationsForOrder(tester);
+    final generate = find.byKey(const Key('generate-recommendations-ORD-1043'));
+    await tester.ensureVisible(generate);
+    await tester.tap(generate);
+    await tester.pumpAndSettle();
+    expect(find.textContaining('required backend service is unavailable'),
+        findsOneWidget);
+    expect(find.byKey(const Key('retry-recommendations-ORD-1043')),
+        findsOneWidget);
+  });
+
+  testWidgets(
+      'HTTP 409 refreshes current state without retrying old recommendations',
+      (tester) async {
+    var recommendationRequests = 0;
+    var stateRequests = 0;
+    await tester.pumpWidget(ZyroInventoryApp(
+      authService: _FakeAuthService(),
+      apiClient: _apiClient(
+        stateRequestCount: () => stateRequests++,
+        onState: () async => http.Response(
+            jsonEncode({
+              ...localDemoSnapshotJson,
+              'version': stateRequests == 1 ? 7 : 8,
+            }),
+            200),
+        onRecommendations: (_) async {
+          recommendationRequests++;
+          return http.Response(
+              '{"detail":{"code":"STALE_VERSION","message":"Snapshot is stale."}}',
+              409);
+        },
+      ),
+    ));
+    await tester.pumpAndSettle();
+    await _openRecommendationsForOrder(tester);
+    final generate = find.byKey(const Key('generate-recommendations-ORD-1043'));
+    await tester.ensureVisible(generate);
+    await tester.tap(generate);
+    await tester.pumpAndSettle();
+    expect(recommendationRequests, 1);
+    expect(stateRequests, 2);
+    expect(find.textContaining('snapshot changed'), findsOneWidget);
+    expect(find.textContaining('Version 8'), findsOneWidget);
+  });
+
+  testWidgets('polling marks recommendation and simulation results outdated',
+      (tester) async {
+    var stateRequests = 0;
+    await tester.pumpWidget(ZyroInventoryApp(
+      authService: _FakeAuthService(),
+      apiClient: _apiClient(
+        stateRequestCount: () => stateRequests++,
+        onState: () async => http.Response(
+            jsonEncode({
+              ...localDemoSnapshotJson,
+              'version': stateRequests == 1 ? 7 : 8,
+            }),
+            200),
+        onRecommendations: (_) async =>
+            http.Response(jsonEncode(localRecommendationResponse), 200),
+        onSimulation: (_) async =>
+            http.Response(jsonEncode(localSimulationResponse), 200),
+      ),
+    ));
+    await tester.pumpAndSettle();
+    await _openRecommendationsForOrder(tester);
+    var action = find.byKey(const Key('generate-recommendations-ORD-1043'));
+    await tester.ensureVisible(action);
+    await tester.tap(action);
+    await tester.pumpAndSettle();
+    action = find.byKey(const Key('simulate-REC-EXPEDITE-7-1043'));
+    await tester.ensureVisible(action);
+    await tester.tap(action);
+    await tester.pumpAndSettle();
+    await tester.pump(const Duration(seconds: 5));
+    await tester.pumpAndSettle();
+
+    expect(find.byKey(const Key('recommendations-outdated')), findsOneWidget);
+    expect(find.byKey(const Key('simulation-outdated-REC-EXPEDITE-7-1043')),
+        findsOneWidget);
+    expect(
+        tester
+            .widget<FilledButton>(
+                find.byKey(const Key('simulate-REC-EXPEDITE-7-1043')))
+            .onPressed,
+        isNull);
+    expect(find.text('Regenerate for v8'), findsOneWidget);
+  });
+
+  testWidgets(
+      'planner and approver can generate and simulate read-only options',
+      (tester) async {
+    for (final role in ['planner', 'approver']) {
+      await tester.pumpWidget(ZyroInventoryApp(
+        authService: _FakeAuthService(),
+        apiClient: _apiClient(
+          role: role,
+          onRecommendations: (_) async =>
+              http.Response(jsonEncode(localRecommendationResponse), 200),
+          onSimulation: (_) async =>
+              http.Response(jsonEncode(localSimulationResponse), 200),
+        ),
+      ));
+      await tester.pumpAndSettle();
+      await _openRecommendationsForOrder(tester);
+      var action = find.byKey(const Key('generate-recommendations-ORD-1043'));
+      await tester.ensureVisible(action);
+      await tester.tap(action);
+      await tester.pumpAndSettle();
+      action = find.byKey(const Key('simulate-REC-EXPEDITE-7-1043'));
+      await tester.ensureVisible(action);
+      await tester.tap(action);
+      await tester.pumpAndSettle();
+      expect(find.byKey(const Key('simulation-result-REC-EXPEDITE-7-1043')),
+          findsOneWidget);
+      expect(find.text('Approve'), findsNothing);
+    }
+  });
+
+  testWidgets('recommendation and simulation workspace fits mobile and desktop',
+      (tester) async {
+    for (final size in [const Size(390, 844), const Size(1280, 900)]) {
+      tester.view.physicalSize = size;
+      tester.view.devicePixelRatio = 1;
+      await tester.pumpWidget(ZyroInventoryApp(
+        authService: _FakeAuthService(),
+        apiClient: _apiClient(
+          onRecommendations: (_) async =>
+              http.Response(jsonEncode(localRecommendationResponse), 200),
+          onSimulation: (_) async =>
+              http.Response(jsonEncode(localSimulationResponse), 200),
+        ),
+      ));
+      await tester.pumpAndSettle();
+      await _openRecommendationsForOrder(tester);
+      var action = find.byKey(const Key('generate-recommendations-ORD-1043'));
+      await tester.ensureVisible(action);
+      await tester.tap(action);
+      await tester.pumpAndSettle();
+      action = find.byKey(const Key('simulate-REC-EXPEDITE-7-1043'));
+      await tester.ensureVisible(action);
+      await tester.tap(action);
+      await tester.pumpAndSettle();
       expect(tester.takeException(), isNull);
     }
     addTearDown(tester.view.resetPhysicalSize);
