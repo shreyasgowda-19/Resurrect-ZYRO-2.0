@@ -10,6 +10,26 @@ import '../../core/models/ai_copilot_models.dart';
 import '../../core/models/proposal_models.dart';
 import '../../core/models/recommendation_models.dart';
 
+class OperationalDashboardData {
+  const OperationalDashboardData({
+    required this.name,
+    required this.snapshot,
+    required this.loading,
+    required this.stale,
+    required this.failure,
+    required this.refresh,
+    required this.materials,
+  });
+
+  final String? name;
+  final InventorySnapshot? snapshot;
+  final bool loading;
+  final bool stale;
+  final String? failure;
+  final VoidCallback refresh;
+  final Widget materials;
+}
+
 class DashboardScreen extends StatefulWidget {
   const DashboardScreen({
     super.key,
@@ -19,8 +39,10 @@ class DashboardScreen extends StatefulWidget {
     required this.getIdToken,
     this.apiClient,
     this.onSignOut,
+    this.operational,
   });
 
+  final OperationalDashboardData? operational;
   final String email;
   final String uid;
   final String role;
@@ -136,12 +158,15 @@ class _DashboardScreenState extends State<DashboardScreen>
     WidgetsBinding.instance.addObserver(this);
     _ownsApiClient = widget.apiClient == null;
     _apiClient = widget.apiClient ?? ApiClient();
-    _refresh();
-    _startPolling();
+    if (widget.operational == null) {
+      _refresh();
+      _startPolling();
+    }
   }
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (widget.operational != null) return;
     final active = state == AppLifecycleState.resumed;
     if (_appIsActive == active) return;
     _appIsActive = active;
@@ -623,6 +648,7 @@ class _DashboardScreenState extends State<DashboardScreen>
     if (_scaffoldKey.currentState?.isDrawerOpen == true) {
       Navigator.of(context).pop();
     }
+    if (widget.operational != null) return;
     final key = switch (section) {
       'materials' => _materialsKey,
       'orders' => _ordersKey,
@@ -1225,11 +1251,13 @@ class _DashboardScreenState extends State<DashboardScreen>
                       color: Color(0xFF9B9CA5))),
             ),
             const SizedBox(height: 36),
+            Expanded(child: ListView(padding: EdgeInsets.zero, children: [
             _navItem('overview', Icons.dashboard_outlined, 'Overview'),
-            _navItem('materials', Icons.inventory_2_outlined, 'Materials'),
+            _navItem('materials', Icons.inventory_2_outlined,
+                widget.operational == null ? 'Materials' : 'Inventory'),
             _navItem(
                 'orders', Icons.local_shipping_outlined, 'Customer orders'),
-            if (widget.role == 'planner')
+            if (widget.role == 'planner' || widget.operational != null)
               _navItem('events', Icons.precision_manufacturing_outlined,
                   'Manufacturing Events'),
             _navItem(
@@ -1237,14 +1265,14 @@ class _DashboardScreenState extends State<DashboardScreen>
             _navItem('history', Icons.history, 'Event history'),
             _navItem('approvals', Icons.fact_check_outlined, 'Approvals'),
             _navItem('copilot', Icons.auto_awesome_outlined, 'AI Copilot'),
-            const Spacer(),
+            ])),
             const Divider(color: Color(0xFF303137)),
             Text(widget.email,
                 maxLines: 1,
                 overflow: TextOverflow.ellipsis,
                 style: const TextStyle(fontWeight: FontWeight.w600)),
             const SizedBox(height: 5),
-            Text('${_titleCase(widget.role)} access',
+            Text(widget.role.isEmpty ? 'Workspace access pending' : '${_titleCase(widget.role)} access',
                 style: const TextStyle(color: Color(0xFFB5B6BE), fontSize: 12)),
             if (widget.onSignOut != null)
               Align(
@@ -1296,9 +1324,12 @@ class _DashboardScreenState extends State<DashboardScreen>
   }
 
   Widget _topBar(BuildContext context, {required bool desktop}) {
-    final snapshot = _snapshot;
+    final operational = widget.operational;
+    final snapshot = operational == null ? _snapshot : operational.snapshot;
+    final loading = operational?.loading ?? _loading;
+    final connected = operational == null ? _backendConnected : snapshot != null && !operational.stale;
     final mode = snapshot == null
-        ? 'Waiting for snapshot'
+        ? (operational == null ? 'Waiting for snapshot' : 'OPERATIONAL WORKSPACE')
         : snapshot.dataMode.toLowerCase() == 'demo'
             ? 'DEMO DATA'
             : '${snapshot.dataMode.toUpperCase()} DATA';
@@ -1329,9 +1360,9 @@ class _DashboardScreenState extends State<DashboardScreen>
                       ?.copyWith(fontWeight: FontWeight.w700)),
               const SizedBox(height: 3),
               Text(
-                snapshot == null
+                operational?.name ?? (snapshot == null
                     ? 'Human-AI Collaborative Smart Inventory Intelligence'
-                    : 'Snapshot v${snapshot.version} · As of ${_formatDate(snapshot.asOfDate)}',
+                    : 'Snapshot v${snapshot.version} · As of ${_formatDate(snapshot.asOfDate)}'),
                 maxLines: 1,
                 overflow: TextOverflow.ellipsis,
                 style: Theme.of(context)
@@ -1344,8 +1375,8 @@ class _DashboardScreenState extends State<DashboardScreen>
           const SizedBox(width: 12),
           OutlinedButton.icon(
             key: const Key('dashboard-refresh-button'),
-            onPressed: _loading ? null : _refresh,
-            icon: _loading || _snapshotRefreshing
+            onPressed: loading ? null : (operational?.refresh ?? _refresh),
+            icon: loading || _snapshotRefreshing
                 ? const SizedBox(
                     width: 15,
                     height: 15,
@@ -1353,7 +1384,9 @@ class _DashboardScreenState extends State<DashboardScreen>
                 : const Icon(Icons.refresh, size: 18),
             label: Text(_snapshotRefreshing
                 ? 'Refreshing…'
-                : desktop
+                : operational != null
+                    ? (desktop ? 'Refresh workspace' : 'Refresh')
+                    : desktop
                     ? 'Refresh snapshot'
                     : 'Refresh'),
           ),
@@ -1361,21 +1394,21 @@ class _DashboardScreenState extends State<DashboardScreen>
         const SizedBox(height: 13),
         Wrap(spacing: 8, runSpacing: 8, children: [
           _MetadataChip(
-            icon: _backendConnected == true
+            icon: connected == true
                 ? Icons.cloud_done_outlined
-                : _backendConnected == false
+                : connected == false
                     ? Icons.cloud_off_outlined
                     : Icons.cloud_sync_outlined,
             label: _checkingBackend
                 ? 'Backend checking'
-                : _backendConnected == true
+                : connected == true
                     ? 'Backend connected'
-                    : _backendConnected == false
+                    : connected == false
                         ? 'Backend unavailable'
                         : 'Backend unchecked',
-            color: _backendConnected == true
+            color: connected == true
                 ? const Color(0xFF54D39A)
-                : _backendConnected == false
+                : connected == false
                     ? const Color(0xFFFF7777)
                     : const Color(0xFFB5B6BE),
           ),
@@ -1394,7 +1427,7 @@ class _DashboardScreenState extends State<DashboardScreen>
               label: 'Version ${snapshot.version}',
               color: const Color(0xFFB5B6BE),
             ),
-          Text('${_titleCase(widget.role)} · ${widget.email}',
+          if (widget.role.isNotEmpty) Text('${_titleCase(widget.role)} · ${widget.email}',
               maxLines: 1,
               overflow: TextOverflow.ellipsis,
               style: const TextStyle(fontSize: 12, color: Color(0xFFB5B6BE))),
@@ -1410,7 +1443,7 @@ class _DashboardScreenState extends State<DashboardScreen>
               .clamp(0.0, 1500.0)
               .toDouble();
           return SingleChildScrollView(
-            key: const Key('dashboard-main-scroll'),
+            key: widget.operational == null ? const Key('dashboard-main-scroll') : ValueKey(_selectedSection),
             padding: EdgeInsets.fromLTRB(
                 horizontalPadding, 24, horizontalPadding, 40),
             child: Center(
@@ -1419,7 +1452,9 @@ class _DashboardScreenState extends State<DashboardScreen>
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.stretch,
                   children: [
-                    if (_loading && _snapshot == null)
+                    if (widget.operational case final operational?)
+                      _operationalBody(operational)
+                    else if (_loading && _snapshot == null)
                       const _LoadingPanel()
                     else if (_error != null && _snapshot == null)
                       _ErrorPanel(
@@ -1520,6 +1555,67 @@ class _DashboardScreenState extends State<DashboardScreen>
           );
         },
       );
+
+  Widget _operationalBody(OperationalDashboardData operational) {
+    final snapshot = operational.snapshot;
+    if (snapshot == null) {
+      if (operational.loading) return const _LoadingPanel();
+      return _ErrorPanel(
+        message: operational.failure ?? 'Workspace unavailable. Try again.',
+        onRetry: operational.refresh,
+        onSignOut: widget.onSignOut,
+      );
+    }
+    final (title, description, content) = switch (_selectedSection) {
+      'materials' => ('Inventory', 'Workspace material availability and metadata.',
+          operational.materials),
+      'orders' => ('Customer orders', 'Projected outcomes from the workspace snapshot.',
+          _SectionCard(child: snapshot.orders.isEmpty
+              ? const _InlineEmpty(message: 'No customer orders in this workspace.')
+              : Column(children: [
+                  for (final order in snapshot.orders)
+                    ListTile(
+                      title: Text(order.orderId),
+                      subtitle: Text(order.customer),
+                      trailing: _RiskPill(risk: order.risk),
+                    ),
+                ]))),
+      'alerts' => ('Risk alerts', 'Risk changes reported by the workspace backend.',
+          _SectionCard(child: snapshot.alerts.isEmpty
+              ? const _InlineEmpty(message: 'No risk alerts in this workspace.')
+              : Column(children: [
+                  for (final alert in snapshot.alerts)
+                    ListTile(title: Text(alert.orderId), subtitle: Text(alert.message)),
+                ]))),
+      'history' => ('Event history', 'Recent events recorded for this workspace.',
+          _eventHistory(snapshot)),
+      'events' => ('Manufacturing Events', 'Operational event submission is unavailable.',
+          const _SectionCard(child: _InlineEmpty(message: 'Manufacturing Events is unavailable for operational workspaces.'))),
+      'approvals' => ('Approvals', 'Operational proposals and purchase orders are unavailable.',
+          const _SectionCard(child: _InlineEmpty(message: 'Approvals is unavailable for operational workspaces.'))),
+      'copilot' => ('AI Copilot', 'Operational AI assistance is unavailable.',
+          const _SectionCard(child: _InlineEmpty(message: 'AI Copilot is unavailable for operational workspaces.'))),
+      _ => ('Overview', 'Customer delivery exposure and material availability for this workspace.',
+          Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+            _overviewCards(snapshot),
+            if (snapshot.materials.isEmpty && snapshot.orders.isEmpty) ...[
+              const SizedBox(height: 14),
+              const _SectionCard(child: _InlineEmpty(message: 'Operational inventory is empty.')),
+            ],
+          ])),
+    };
+    return Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+      if (operational.stale) ...[
+        const _InlineNotice('Showing stale operational inventory.'),
+        if (operational.failure != null)
+          _InlineErrorMessage(operational.failure!),
+        const SizedBox(height: 14),
+      ],
+      _sectionHeading(_overviewKey, title, description),
+      const SizedBox(height: 14),
+      content,
+    ]);
+  }
 
   Widget _sectionHeading(GlobalKey key, String title, String subtitle) =>
       Container(

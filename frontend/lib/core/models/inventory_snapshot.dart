@@ -29,6 +29,8 @@ class MaterialInventory {
     required this.incoming,
     required this.allocated,
     required this.netAvailable,
+    this.reorderThreshold = 0,
+    this.description,
   });
 
   final String materialId;
@@ -38,6 +40,8 @@ class MaterialInventory {
   final int incoming;
   final int allocated;
   final int netAvailable;
+  final int reorderThreshold;
+  final String? description;
 
   factory MaterialInventory.fromJson(Map<String, dynamic> json) =>
       MaterialInventory(
@@ -48,6 +52,14 @@ class MaterialInventory {
         incoming: _requiredInt(json, 'incoming', nonNegative: true),
         allocated: _requiredInt(json, 'allocated', nonNegative: true),
         netAvailable: _requiredInt(json, 'net_available'),
+        reorderThreshold: json.containsKey('reorder_threshold')
+            ? _requiredInt(json, 'reorder_threshold', nonNegative: true)
+            : 0,
+        description: json['description'] == null
+            ? null
+            : (json['description'] is String
+                ? json['description'] as String
+                : throw const FormatException('Invalid material description.')),
       );
 }
 

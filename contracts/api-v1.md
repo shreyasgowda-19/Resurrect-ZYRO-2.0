@@ -362,3 +362,25 @@ HTTP 200 returns the same inventory fields and item shapes as `GET /state`, with
 | 503 | Authentication or operational storage unavailable, including invalid stored workspace data |
 
 Errors use `{"detail":{"code":"...","message":"..."}}`. Both routes are read-only. No public provisioning, operational mutation, or workspace discovery endpoint is introduced in T8.1. The dashboard treats HTTP 200 with empty lists as an empty workspace and marks retained data stale after a transient failure. A 401 or 403 invalidates the displayed data. No operational failure falls back to demonstration data.
+
+## T8.2 operational materials
+
+The operational state endpoint adds `reorder_threshold` (non-negative integer) and `description` (nullable string) to each material. Demo responses retain their existing shape.
+
+- `POST /workspaces/{workspace_id}/materials` creates a material. Send `material_id`, `name`, `unit`, `reorder_threshold`, `expected_version`, and `mutation_id`. `description` is optional. The new material has zero physical stock.
+- `PATCH /workspaces/{workspace_id}/materials/{material_id}` edits metadata. Send `expected_version`, `mutation_id`, and at least one of `name`, `unit`, `reorder_threshold`, or `description`. Null clears the description. The ID and stock cannot be edited.
+
+IDs are case-insensitive and stored in uppercase. They must contain 1 to 64 letters, digits, dots, underscores, or hyphens, starting with a letter or digit. Names and units have limits of 120 and 32 characters. Descriptions have a limit of 500 characters. Reorder thresholds are integers from 0 to 9007199254740991. Mutation IDs are nonempty strings up to 128 characters.
+
+Both endpoints require Firebase authentication and an active Planner membership in the selected workspace. HTTP 200 returns `status` (`applied` or `duplicate`), `workspace_id`, `version`, and `material` (same shape as the operational state material). A successful write increments the version once. An identical retry by the same actor with the same mutation ID returns the original result even if the version has advanced.
+
+| Status | Meaning |
+| --- | --- |
+| 401 | Missing or invalid authentication |
+| 403 | Workspace unavailable to caller or Planner membership required |
+| 404 | Material to edit does not exist |
+| 409 | Stale version, duplicate material ID, or mutation ID conflict |
+| 422 | Invalid input, including a stock field or an immutable ID in an edit body |
+| 503 | Authentication or workspace storage unavailable |
+
+Errors use the existing structured `detail` envelope. Mutation IDs and audit entries are scoped to the workspace. Both are written atomically with the inventory change.
