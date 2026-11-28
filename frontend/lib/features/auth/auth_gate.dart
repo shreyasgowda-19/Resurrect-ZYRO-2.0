@@ -40,6 +40,7 @@ class AuthGate extends StatelessWidget {
             return OperationalWorkspaceScreen(
               key: ValueKey((user.uid, selectedWorkspace)),
               workspaceId: selectedWorkspace,
+              email: user.email,
               getIdToken: user.getIdToken,
               apiClient: apiClient,
               onSignOut: () => _confirmSignOut(context, authService),

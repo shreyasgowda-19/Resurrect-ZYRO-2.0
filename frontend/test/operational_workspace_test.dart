@@ -72,20 +72,26 @@ void main() {
     expect(find.textContaining('Version 2'), findsOneWidget);
     expect(paths, ['/workspaces/$workspace', '/workspaces/$workspace/state']);
 
+    await tester.tap(find.byKey(const Key('dashboard-menu-button')));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Inventory'));
+    await tester.pumpAndSettle();
+    expect(find.text('No materials in this workspace.'), findsOneWidget);
+
     version = 1;
-    await tester.tap(find.text('Refresh workspace'));
+    await tester.tap(find.byKey(const Key('dashboard-refresh-button')));
     await tester.pumpAndSettle();
     expect(find.text('Showing stale operational inventory.'), findsOneWidget);
     expect(find.textContaining('Version 2'), findsOneWidget);
 
     status = 503;
-    await tester.tap(find.text('Refresh workspace'));
+    await tester.tap(find.byKey(const Key('dashboard-refresh-button')));
     await tester.pumpAndSettle();
     expect(find.text('Workspace unavailable. Try again.'), findsOneWidget);
     expect(find.text('Showing stale operational inventory.'), findsOneWidget);
 
     status = 403;
-    await tester.tap(find.text('Refresh workspace'));
+    await tester.tap(find.byKey(const Key('dashboard-refresh-button')));
     await tester.pumpAndSettle();
     expect(
         find.text('You do not have access to this workspace.'), findsOneWidget);

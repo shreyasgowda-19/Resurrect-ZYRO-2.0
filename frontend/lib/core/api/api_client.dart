@@ -136,6 +136,14 @@ class StateApiException implements Exception {
   final StateApiFailure failure;
 }
 
+class WorkspaceMaterialException implements Exception {
+  const WorkspaceMaterialException(this.code, {this.status, this.retryable = false});
+
+  final String code;
+  final int? status;
+  final bool retryable;
+}
+
 class WorkspaceInfo {
   const WorkspaceInfo({required this.name});
 
@@ -221,6 +229,68 @@ class ApiClient {
       );
     } on FormatException {
       throw const StateApiException(StateApiFailure.malformedResponse);
+    }
+  }
+
+  Future<String> saveWorkspaceMaterial({
+    required String idToken,
+    required String workspaceId,
+    required String materialId,
+    required bool create,
+    required String name,
+    required String unit,
+    required int reorderThreshold,
+    required String? description,
+    required int expectedVersion,
+    required String mutationId,
+  }) async {
+    if (!RegExp(r'^[a-f0-9]{32}$').hasMatch(workspaceId)) {
+      throw const WorkspaceMaterialException('INVALID_REQUEST');
+    }
+    final path = '${ApiConfig.baseUrl}/workspaces/$workspaceId/materials';
+    final uri = Uri.parse(create ? path : '$path/${Uri.encodeComponent(materialId)}');
+    final headers = {
+      'Authorization': 'Bearer $idToken',
+      'Content-Type': 'application/json',
+    };
+    final body = jsonEncode({
+      if (create) 'material_id': materialId,
+      'name': name,
+      'unit': unit,
+      'reorder_threshold': reorderThreshold,
+      'description': description,
+      'expected_version': expectedVersion,
+      'mutation_id': mutationId,
+    });
+    try {
+      final response = await (create
+              ? _client.post(uri, headers: headers, body: body)
+              : _client.patch(uri, headers: headers, body: body))
+          .timeout(_timeout);
+      if (response.statusCode != 200) {
+        final code = _eventErrorDetail(response.body)['code'];
+        throw WorkspaceMaterialException(
+          code is String ? code : 'REQUEST_FAILED',
+          status: response.statusCode,
+          retryable: response.statusCode >= 500,
+        );
+      }
+      final payload = _asJsonMap(jsonDecode(response.body));
+      final status = payload['status'];
+      if (payload['workspace_id'] != workspaceId ||
+          (status != 'applied' && status != 'duplicate') ||
+          payload['version'] != expectedVersion + 1 ||
+          payload['material'] is! Map<String, dynamic> ||
+          payload['material']['material_id'] is! String ||
+          (payload['material']['material_id'] as String).toUpperCase() !=
+              materialId.toUpperCase()) {
+        throw const WorkspaceMaterialException('INVALID_RESPONSE', retryable: true);
+      }
+      return status as String;
+    } on WorkspaceMaterialException {
+      rethrow;
+    } on Exception {
+      throw const WorkspaceMaterialException('REQUEST_UNCERTAIN', retryable: true);
     }
   }
 

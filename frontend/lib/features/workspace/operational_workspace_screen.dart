@@ -4,6 +4,8 @@ import 'package:flutter/material.dart';
 
 import '../../core/api/api_client.dart';
 import '../../core/models/inventory_snapshot.dart';
+import '../dashboard/dashboard_screen.dart';
+import 'material_editor.dart';
 
 class OperationalWorkspaceScreen extends StatefulWidget {
   const OperationalWorkspaceScreen({
@@ -12,9 +14,11 @@ class OperationalWorkspaceScreen extends StatefulWidget {
     required this.getIdToken,
     required this.onSignOut,
     this.apiClient,
+    this.email = '',
   });
 
   final String workspaceId;
+  final String email;
   final Future<String> Function() getIdToken;
   final VoidCallback onSignOut;
   final ApiClient? apiClient;
@@ -33,6 +37,8 @@ class _OperationalWorkspaceScreenState
   String? _role;
   bool _loading = true;
   bool _stale = false;
+  bool _editorOpen = false;
+  String? _notice;
   String? _failure;
 
   @override
@@ -41,7 +47,7 @@ class _OperationalWorkspaceScreenState
     _api = widget.apiClient ?? ApiClient();
     unawaited(_refresh());
     _poll = Timer.periodic(const Duration(seconds: 15), (_) {
-      if (!_loading) unawaited(_refresh());
+      if (!_loading && !_editorOpen) unawaited(_refresh());
     });
   }
 
@@ -106,67 +112,106 @@ class _OperationalWorkspaceScreenState
     });
   }
 
+  Future<void> _editMaterial([MaterialInventory? item]) async {
+    final snapshot = _snapshot;
+    if (_editorOpen ||
+        _loading ||
+        _stale ||
+        _role != 'planner' ||
+        snapshot == null) {
+      return;
+    }
+    setState(() {
+      _editorOpen = true;
+      _notice = null;
+    });
+    final outcome = await showDialog<String>(
+      context: context,
+      barrierDismissible: false,
+      builder: (context) => MaterialEditor(
+        api: _api,
+        workspaceId: widget.workspaceId,
+        version: snapshot.version,
+        getIdToken: widget.getIdToken,
+        material: item,
+      ),
+    );
+    if (!mounted) return;
+    setState(() {
+      _editorOpen = false;
+      _notice = switch (outcome) {
+        'applied' ||
+        'duplicate' =>
+          item == null ? 'Material added.' : 'Material updated.',
+        'STALE_VERSION' =>
+          'Inventory changed. Review the refreshed workspace before editing.',
+        'ACCESS_CHANGED' => 'Planner access is required to save a material.',
+        'REFRESH' => null,
+        null => null,
+        _ => 'The material could not be saved. Review the refreshed workspace.',
+      };
+    });
+    if (outcome != null) await _refresh();
+  }
+
   @override
   Widget build(BuildContext context) {
     final snapshot = _snapshot;
-    return Scaffold(
-      appBar: AppBar(
-        title: const Text('Operational workspace'),
-        actions: [
-          TextButton(
-              onPressed: widget.onSignOut, child: const Text('Sign out')),
-        ],
-      ),
-      body: Center(
-        child: ConstrainedBox(
-          constraints: const BoxConstraints(maxWidth: 960),
-          child: ListView(
-            padding: const EdgeInsets.all(24),
-            children: [
-              if (_loading) ...[
-                const LinearProgressIndicator(),
-                const SizedBox(height: 12),
-                Text(snapshot == null
-                    ? 'Loading operational workspace...'
-                    : 'Refreshing operational inventory...'),
-              ],
-              if (_failure != null) ...[
-                if (_stale) const Text('Showing stale operational inventory.'),
-                Text(_failure!),
-              ],
+    final canEdit = _role == 'planner' && !_loading && !_stale && !_editorOpen;
+    return DashboardScreen(
+      uid: '',
+      email: widget.email,
+      role: _role ?? '',
+      getIdToken: widget.getIdToken,
+      apiClient: _api,
+      onSignOut: widget.onSignOut,
+      operational: OperationalDashboardData(
+        name: _info?.name,
+        snapshot: snapshot,
+        loading: _loading,
+        stale: _stale,
+        failure: _failure,
+        refresh: () {
+          if (!_loading && !_editorOpen) unawaited(_refresh());
+        },
+        materials: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            if (_notice != null) Text(_notice!),
+            if (_role == 'planner')
               Align(
                 alignment: Alignment.centerLeft,
-                child: OutlinedButton(
-                  onPressed: _loading ? null : _refresh,
-                  child: const Text('Refresh workspace'),
+                child: FilledButton.icon(
+                  onPressed: canEdit ? () => _editMaterial() : null,
+                  icon: const Icon(Icons.add),
+                  label: const Text('Add Material'),
                 ),
               ),
-              if (snapshot != null) ...[
-                Text(_info!.name,
-                    style: Theme.of(context).textTheme.headlineSmall),
-                Text('Version ${snapshot.version} · ${_role!} access'),
-                const SizedBox(height: 18),
-                if (snapshot.materials.isEmpty && snapshot.orders.isEmpty)
-                  const Text('Operational inventory is empty.')
-                else ...[
-                  Text('Materials (${snapshot.materials.length})'),
-                  for (final item in snapshot.materials)
-                    ListTile(
-                      title: Text(item.name),
-                      subtitle:
-                          Text('${item.netAvailable} ${item.unit} available'),
-                    ),
-                  Text('Customer orders (${snapshot.orders.length})'),
-                  for (final order in snapshot.orders)
-                    ListTile(
-                      title: Text(order.orderId),
-                      subtitle: Text(order.customer),
-                      trailing: Text(order.risk.label),
-                    ),
-                ],
-              ],
-            ],
-          ),
+            if (snapshot?.materials.isEmpty == true)
+              const Card(
+                  child:
+                      ListTile(title: Text('No materials in this workspace.'))),
+            for (final item
+                in snapshot?.materials ?? const <MaterialInventory>[])
+              Card(
+                child: ListTile(
+                  title: Text(item.name),
+                  subtitle: Text([
+                    '${item.materialId} · ${item.onHand} ${item.unit} on hand',
+                    '${item.incoming} incoming ? ${item.allocated} allocated ? ${item.netAvailable} available',
+                    'Reorder threshold ${item.reorderThreshold}',
+                    if (item.description?.isNotEmpty == true) item.description!,
+                  ].join('\n')),
+                  trailing: _role == 'planner'
+                      ? IconButton(
+                          tooltip: 'Edit ${item.materialId}',
+                          onPressed: canEdit ? () => _editMaterial(item) : null,
+                          icon: const Icon(Icons.edit_outlined),
+                        )
+                      : null,
+                ),
+              ),
+          ],
         ),
       ),
     );
